@@ -9,6 +9,7 @@ PROJECT N-ONE is a Streamlit-based surveillance console for identity-aware monit
 - Multi-mode surveillance workflow:
   - Lost Person Search (target alert mode)
   - Member Attendance Logger
+    - Automatically logs and re-identifies unknown persons
   - Threat & Weapon Detection Mode
 - Live frame visualization and status updates
 - Append-only audit logging to CSV

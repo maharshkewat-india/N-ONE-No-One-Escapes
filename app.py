@@ -46,11 +46,15 @@ LOG_DIR = ROOT_DIR / "detection_logs"
 CSV_LOG_PATH = LOG_DIR / "system_audit_logs.csv"
 TEMP_FRAME_PATH = ROOT_DIR / "temp_current_frame.jpg"
 TEMP_VIDEO_PATH = ROOT_DIR / "temp_video_upload.mp4"
+UNKNOWN_DIR = ROOT_DIR / "unknown_faces"
+UNKNOWN_DB_PATH = ROOT_DIR / "unknown_person_db.csv"
+UNKNOWN_SIGHTING_LOG_PATH = ROOT_DIR / "unknown_sighting_log.csv"
 
 
 def initialize_directories() -> None:
     REG_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
+    UNKNOWN_DIR.mkdir(exist_ok=True)
 
 
 def initialize_log_file() -> None:
@@ -59,6 +63,128 @@ def initialize_log_file() -> None:
             CSV_LOG_PATH,
             index=False,
         )
+    if not UNKNOWN_DB_PATH.exists():
+        pd.DataFrame(
+            columns=["unknown_id", "image_path", "first_seen_timestamp", "last_seen_timestamp", "last_known_location"]
+        ).to_csv(UNKNOWN_DB_PATH, index=False)
+    if not UNKNOWN_SIGHTING_LOG_PATH.exists():
+        pd.DataFrame(columns=["sighting_id", "unknown_id", "timestamp", "location"]).to_csv(
+            UNKNOWN_SIGHTING_LOG_PATH, index=False
+        )
+
+
+def get_next_unknown_id() -> str:
+    if not UNKNOWN_DB_PATH.exists() or pd.read_csv(UNKNOWN_DB_PATH).empty:
+        return "unknown_001"
+    db_df = pd.read_csv(UNKNOWN_DB_PATH)
+    last_id = db_df["unknown_id"].max()
+    last_num = int(last_id.split("_")[-1])
+    return f"unknown_{last_num + 1:03d}"
+
+
+def register_new_unknown(face_roi, location: str) -> str:
+    unknown_id = get_next_unknown_id()
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    image_path = UNKNOWN_DIR / f"{unknown_id}.jpg"
+    cv2.imwrite(str(image_path), face_roi)
+
+    new_person_df = pd.DataFrame(
+        [[unknown_id, str(image_path), timestamp, timestamp, location]],
+        columns=["unknown_id", "image_path", "first_seen_timestamp", "last_seen_timestamp", "last_known_location"],
+    )
+    new_person_df.to_csv(UNKNOWN_DB_PATH, mode="a", header=False, index=False)
+    log_sighting(unknown_id, timestamp, location)
+    # Invalidate deepface cache
+    if (UNKNOWN_DIR / "representations_facenet.pkl").exists():
+        (UNKNOWN_DIR / "representations_facenet.pkl").unlink()
+    return unknown_id
+
+
+def log_sighting(unknown_id: str, timestamp: str, location: str) -> None:
+    sighting_df = pd.read_csv(UNKNOWN_SIGHTING_LOG_PATH)
+    sighting_id = len(sighting_df) + 1
+    new_sighting_df = pd.DataFrame(
+        [[sighting_id, unknown_id, timestamp, location]], columns=["sighting_id", "unknown_id", "timestamp", "location"]
+    )
+    new_sighting_df.to_csv(UNKNOWN_SIGHTING_LOG_PATH, mode="a", header=False, index=False)
+
+
+def update_unknown_sighting(unknown_id: str, location: str) -> str:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    db_df = pd.read_csv(UNKNOWN_DB_PATH)
+    db_df.loc[db_df["unknown_id"] == unknown_id, "last_seen_timestamp"] = timestamp
+    db_df.loc[db_df["unknown_id"] == unknown_id, "last_known_location"] = location
+    db_df.to_csv(UNKNOWN_DB_PATH, index=False)
+    log_sighting(unknown_id, timestamp, location)
+    last_seen = db_df.loc[db_df["unknown_id"] == unknown_id, "first_seen_timestamp"].iloc[0]
+    return last_seen
+
+
+def handle_unknown_person(face_roi, annotated_frame, x, y, w, h) -> tuple[np.ndarray, str]:
+    if DeepFace is None:
+        return annotated_frame, "DeepFace not available for unknown matching."
+
+    temp_frame_path = TEMP_FRAME_PATH
+    cv2.imwrite(str(temp_frame_path), face_roi)
+    detection_summary = "Face detected but no known match"
+
+    try:
+        # Check if the unknown person is already in our DB
+        results = DeepFace.find(
+            img_path=str(temp_frame_path),
+            db_path=str(UNKNOWN_DIR),
+            model_name="Facenet",
+            enforce_detection=False,
+            detector_backend="opencv",
+            silent=True,
+        )
+        if results and len(results) > 0 and not results[0].empty:
+            result_row = results[0].iloc[0]
+            identity_path = str(result_row.get("identity", ""))
+            unknown_id = Path(identity_path).stem
+            last_seen = update_unknown_sighting(unknown_id, "Main Feed")
+            detection_summary = f"Re-identified: {unknown_id}"
+            # Annotate frame
+            cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (255, 165, 0), 2)
+            cv2.putText(
+                annotated_frame,
+                f"ID: {unknown_id}",
+                (x, max(0, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 165, 0),
+                2,
+            )
+            cv2.putText(
+                annotated_frame,
+                f"First Seen: {last_seen}",
+                (x, max(0, y - 28)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 165, 0),
+                1,
+            )
+        else:
+            # This is a new unknown person
+            unknown_id = register_new_unknown(face_roi, "Main Feed")
+            detection_summary = f"New Unknown Person Registered: {unknown_id}"
+            cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (255, 255, 0), 2)
+            cv2.putText(
+                annotated_frame,
+                f"New ID: {unknown_id}",
+                (x, max(0, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 0),
+                2,
+            )
+
+    except Exception as e:
+        detection_summary = "Error during unknown person matching."
+        st.session_state.last_detection_details = str(e)
+
+    return annotated_frame, detection_summary
+
 
 
 def log_event(mode: str, name: str, role: str, status: str) -> None:
@@ -323,12 +449,13 @@ def process_frame(frame, mode: str, profiles: list[dict]) -> tuple[np.ndarray, s
             st.session_state.last_status = detection_summary
             return annotated_frame, detection_summary
 
-    if profiles and len(faces) > 0:
+    if len(faces) > 0:
         st.session_state.last_status = "Matching... please wait"
         face_found = False
         for (x, y, w, h) in faces:
             face_roi = frame[y : y + h, x : x + w]
             matched, name, role = match_identity(face_roi, profiles)
+
             if matched:
                 face_found = True
                 color = (0, 255, 0) if role == "Member" else (0, 0, 255)
@@ -352,6 +479,11 @@ def process_frame(frame, mode: str, profiles: list[dict]) -> tuple[np.ndarray, s
                 else:
                     detection_summary = f"Identity matched: {name}"
                 break
+            elif "2. Member Attendance" in mode:
+                annotated_frame, detection_summary = handle_unknown_person(face_roi, annotated_frame, x, y, w, h)
+                face_found = True
+                break
+
         if not face_found and len(faces) > 0:
             detection_summary = "Face detected but no known match"
             st.session_state.last_status = detection_summary
@@ -564,7 +696,45 @@ def render_main_ui() -> None:
             mime="text/csv",
         )
 
+    st.subheader("🕵️ Unknown & Re-Identified Person Logs")
+    col_unknown1, col_unknown2 = st.columns(2)
+    with col_unknown1:
+        st.markdown("**Unknown Persons Database**")
+        if UNKNOWN_DB_PATH.exists():
+            unknown_df = pd.read_csv(UNKNOWN_DB_PATH)
+            st.dataframe(unknown_df, use_container_width=True)
+    with col_unknown2:
+        st.markdown("**Sighting Log for Unknowns**")
+        if UNKNOWN_SIGHTING_LOG_PATH.exists():
+            sighting_df = pd.read_csv(UNKNOWN_SIGHTING_LOG_PATH)
+            st.dataframe(sighting_df, use_container_width=True)
+
+    with st.expander("🕵️‍♂️ Unknown Persons Gallery", expanded=False):
+        render_unknown_gallery()
+
     st.caption(f"Status: {st.session_state.last_status} | {st.session_state.last_detection}")
+
+
+def render_unknown_gallery():
+    if not UNKNOWN_DB_PATH.exists() or pd.read_csv(UNKNOWN_DB_PATH).empty:
+        st.info("No unknown persons have been logged yet.")
+        return
+
+    st.markdown("A visual log of all unique unknown individuals detected by the system.")
+    unknown_df = pd.read_csv(UNKNOWN_DB_PATH)
+    
+    num_cols = 5  # Define number of columns for the gallery
+    cols = st.columns(num_cols)
+    
+    for index, row in unknown_df.iterrows():
+        col_index = index % num_cols
+        with cols[col_index]:
+            if Path(row["image_path"]).exists():
+                st.image(row["image_path"], use_column_width=True)
+                st.caption(f"ID: {row['unknown_id']}")
+                st.caption(f"First Seen: {row['first_seen_timestamp']}")
+            else:
+                st.warning(f"""ID: {row['unknown_id']}\n(Image not found)""")
 
 
 def main() -> None:
