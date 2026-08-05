@@ -77,6 +77,7 @@ def configure_session_state() -> None:
         "last_frame": None,
         "last_status": "Idle",
         "last_detection": "No detections yet",
+        "last_detection_details": "No details available",
         "last_logged_event": "",
         "last_match_snapshot": None,
         "last_match_caption": "",
@@ -85,6 +86,23 @@ def configure_session_state() -> None:
         st.session_state.setdefault(key, value)
 
 
+def clear_registered_profiles() -> None:
+    if not REG_DIR.exists():
+        return
+    for image_file in REG_DIR.glob("*"):
+        if image_file.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
+            image_file.unlink()
+    get_registered_profiles.clear()
+
+
+def clear_audit_log() -> None:
+    pd.DataFrame(columns=["Timestamp", "Mode", "Subject_Name", "Role", "Event_Status"]).to_csv(
+        CSV_LOG_PATH,
+        index=False,
+    )
+
+
+@st.cache_data
 def get_registered_profiles() -> list[dict]:
     profiles: list[dict] = []
     if not REG_DIR.exists():
@@ -94,7 +112,18 @@ def get_registered_profiles() -> list[dict]:
             continue
         name = image_file.stem.split("_", 1)[-1]
         role_type = "Lost" if image_file.stem.startswith("Lost") else "Member"
-        profiles.append({"name": name, "role": role_type, "path": str(image_file)})
+        profile_face = cv2.imread(str(image_file))
+        profile_face = extract_face_crop(profile_face)
+        profile_face = standardize_face(profile_face)
+        descriptor = compute_orb_descriptors(profile_face)
+        profiles.append(
+            {
+                "name": name,
+                "role": role_type,
+                "path": str(image_file),
+                "orb_descriptor": descriptor,
+            }
+        )
     return profiles
 
 
@@ -107,9 +136,11 @@ def save_registered_profile(name: str, role_label: str, uploaded_file) -> bool:
     with Image.open(uploaded_file) as img:
         img = img.convert("RGB")
         img.save(destination)
+    get_registered_profiles.clear()
     return True
 
 
+@st.cache_resource
 def load_face_cascade():
     cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     return cv2.CascadeClassifier(cascade_path)
@@ -121,6 +152,32 @@ def compute_face_histogram(image_bgr) -> np.ndarray:
     hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
     cv2.normalize(hist, hist)
     return hist
+
+@st.cache_resource
+def create_orb_detector():
+    return cv2.ORB_create(nfeatures=500)
+
+
+def compute_orb_descriptors(image_bgr):
+    if image_bgr is None or image_bgr.size == 0:
+        return None
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    orb = create_orb_detector()
+    _, descriptors = orb.detectAndCompute(gray, None)
+    return descriptors
+
+
+def compare_orb_descriptors(left_desc, right_desc):
+    if left_desc is None or right_desc is None:
+        return float("inf"), 0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(left_desc, right_desc)
+    if not matches:
+        return float("inf"), 0
+    matches = sorted(matches, key=lambda m: m.distance)
+    top_matches = matches[:30]
+    avg_distance = sum(m.distance for m in top_matches) / len(top_matches)
+    return avg_distance, len(matches)
 
 
 def extract_faces(frame):
@@ -153,23 +210,18 @@ def fallback_identity_match(frame, profiles: list[dict]) -> tuple[bool, str, str
     best_role = ""
     best_score = float("inf")
     frame_face = standardize_face(frame)
-    hist_current = compute_face_histogram(frame_face)
+    frame_descriptor = compute_orb_descriptors(frame_face)
     for profile in profiles:
         try:
-            profile_image = cv2.imread(profile["path"])
-            if profile_image is None:
-                continue
-            profile_face = extract_face_crop(profile_image)
-            profile_face = standardize_face(profile_face)
-            hist_profile = compute_face_histogram(profile_face)
-            score = cv2.compareHist(hist_current, hist_profile, cv2.HISTCMP_CHISQR)
-            if score < best_score:
+            profile_descriptor = profile.get("orb_descriptor")
+            score, matches = compare_orb_descriptors(frame_descriptor, profile_descriptor)
+            if matches >= 12 and score < best_score:
                 best_score = score
                 best_name = profile["name"]
                 best_role = profile["role"]
         except Exception:
             continue
-    if best_name and best_score < 120:
+    if best_name and best_score < 60:
         return True, best_name, best_role
     return False, "", ""
 
@@ -198,6 +250,24 @@ def deepface_identity_match(frame, profiles: list[dict]) -> tuple[bool, str, str
         role_type = "Lost" if Path(identity_path).stem.startswith("Lost") else "Member"
         return True, identity_name, role_type
     return False, "", ""
+
+
+def capture_match_snapshot(face_roi, name: str, role: str, detection_summary: str):
+    if face_roi is None or face_roi.size == 0:
+        return None
+    snapshot = face_roi.copy()
+    color = (0, 255, 0) if role == "Member" else (0, 0, 255)
+    cv2.rectangle(snapshot, (0, 0), (snapshot.shape[1] - 1, snapshot.shape[0] - 1), color, 2)
+    cv2.putText(
+        snapshot,
+        f"{role}: {name}",
+        (8, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        color,
+        2,
+    )
+    return cv2.cvtColor(snapshot, cv2.COLOR_BGR2RGB)
 
 
 def match_identity(frame, profiles: list[dict]) -> tuple[bool, str, str]:
@@ -250,6 +320,8 @@ def process_frame(frame, mode: str, profiles: list[dict]) -> tuple[np.ndarray, s
                     2,
                 )
             detection_summary = "Threat contour heuristic alert"
+            st.session_state.last_status = detection_summary
+            return annotated_frame, detection_summary
 
     if profiles and len(faces) > 0:
         st.session_state.last_status = "Matching... please wait"
@@ -270,6 +342,9 @@ def process_frame(frame, mode: str, profiles: list[dict]) -> tuple[np.ndarray, s
                     color,
                     2,
                 )
+                snapshot_image = capture_match_snapshot(face_roi, name, role, detection_summary)
+                st.session_state.last_match_snapshot = snapshot_image
+                st.session_state.last_match_caption = f"{role}: {name}"
                 if "1. Lost Person" in mode and role == "Lost":
                     detection_summary = f"Lost person target located: {name}"
                 elif "2. Member Attendance" in mode and role == "Member":
@@ -332,6 +407,14 @@ def render_sidebar() -> None:
                 st.session_state.last_status = "Profile saved"
             else:
                 st.sidebar.error("Provide both a name and a photo before saving.")
+        if st.sidebar.button("🧹 Clear Registered Profiles", use_container_width=True):
+            clear_registered_profiles()
+            st.sidebar.success("All registered profiles deleted.")
+            st.session_state.last_status = "Registered profiles cleared"
+        if st.sidebar.button("📄 Reset Audit Log", use_container_width=True):
+            clear_audit_log()
+            st.sidebar.success("Audit log reset.")
+            st.session_state.last_status = "Audit log reset"
     else:
         st.sidebar.info("Registration is restricted to administrators.")
 
@@ -372,7 +455,7 @@ def render_main_ui() -> None:
             TEMP_VIDEO_PATH.write_bytes(uploaded_video.getbuffer())
             video_target = str(TEMP_VIDEO_PATH)
             st.markdown("**Uploaded video preview**")
-            st.video(uploaded_video)
+            st.video(str(TEMP_VIDEO_PATH))
     elif source_type == "IP Camera Stream":
         rtsp_url = st.text_input(
             "Enter RTSP / HTTP Camera Stream URL",
@@ -391,6 +474,12 @@ def render_main_ui() -> None:
     col_metric1.metric("Active RBAC Role", st.session_state.role)
     col_metric2.metric("Registered Profiles", len(profiles))
     col_metric3.metric("Audit Log Entries", len(log_df))
+    with st.expander("Registered profile details", expanded=False):
+        if profiles:
+            for profile in profiles:
+                st.write(f"- **{profile['role']}**: {profile['name']}")
+        else:
+            st.info("No registered faces available. Add profiles from the admin sidebar.")
 
     st.markdown("---")
     button_label = "🟢 Surveillance: On" if st.session_state.streaming else "🔴 Surveillance: Off"
@@ -400,15 +489,31 @@ def render_main_ui() -> None:
         st.rerun()
 
     st.markdown("---")
-    if st.session_state.last_frame is None:
-        placeholder = st.empty()
-        placeholder.info("Camera feed will appear here after the stream starts.")
+    status_area = st.empty()
+    status_text = st.session_state.last_status or "Idle"
+    if "Matching" in status_text:
+        status_area.info(status_text)
+    elif "Threat" in status_text or "alert" in status_text.lower():
+        status_area.error(status_text)
+    elif status_text in {"Streaming started", "Streaming stopped", "Idle", "Profile saved", "Registered profiles cleared", "Audit log reset"}:
+        status_area.info(status_text)
     else:
-        st.image(st.session_state.last_frame, channels="RGB", use_container_width=True)
+        status_area.success(status_text)
+
+    with st.expander("📝 Last Detection Details", expanded=True):
+        st.write(st.session_state.last_detection_details)
+
+    frame_placeholder = st.empty()
+    snapshot_placeholder = st.empty()
+
+    if st.session_state.last_frame is None:
+        frame_placeholder.info("Camera feed will appear here after the stream starts.")
+    else:
+        frame_placeholder.image(st.session_state.last_frame, channels="RGB", use_container_width=True)
 
     if st.session_state.last_match_snapshot is not None:
-        st.markdown("### 📸 Match Snapshot")
-        st.image(st.session_state.last_match_snapshot, caption=st.session_state.last_match_caption, channels="RGB", use_container_width=True)
+        snapshot_placeholder.markdown("### 📸 Match Snapshot")
+        snapshot_placeholder.image(st.session_state.last_match_snapshot, caption=st.session_state.last_match_caption, channels="RGB", use_container_width=True)
 
     if st.session_state.authenticated and st.session_state.streaming and video_target is not None:
         cap = cv2.VideoCapture(video_target)
@@ -426,30 +531,25 @@ def render_main_ui() -> None:
                 annotated_frame, detection_summary = process_frame(frame, mode, profiles)
                 st.session_state.last_detection = detection_summary
                 st.session_state.last_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                st.image(st.session_state.last_frame, channels="RGB", use_container_width=True)
+                frame_placeholder.image(st.session_state.last_frame, channels="RGB", use_container_width=True)
+
+                if st.session_state.last_match_snapshot is not None:
+                    snapshot_placeholder.markdown("### 📸 Match Snapshot")
+                    snapshot_placeholder.image(st.session_state.last_match_snapshot, caption=st.session_state.last_match_caption, channels="RGB", use_container_width=True)
 
                 event_key = f"{mode}|{detection_summary}"
                 if detection_summary and event_key != st.session_state.last_logged_event:
                     if "1. Lost Person" in mode and "Lost person target located" in detection_summary:
                         log_event(mode, detection_summary.split(":", 1)[-1].strip(), "Lost Victim", "Target Located")
                         st.session_state.last_logged_event = event_key
-                        st.session_state.last_match_snapshot = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                        st.session_state.last_match_caption = detection_summary
                     elif "2. Member Attendance" in mode and "Known member acknowledged" in detection_summary:
                         log_event(mode, detection_summary.split(":", 1)[-1].strip(), "Staff/Member", "Checked In")
                         st.session_state.last_logged_event = event_key
-                        st.session_state.last_match_snapshot = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                        st.session_state.last_match_caption = detection_summary
                     elif "3. Threat" in mode and "Threat" in detection_summary:
                         log_event(mode, "Unknown Weapon", "Threat", "Weapon Pattern Detected")
                         st.session_state.last_logged_event = event_key
-                        st.session_state.last_match_snapshot = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                        st.session_state.last_match_caption = detection_summary
 
                 time.sleep(0.08)
-                if st.session_state.streaming:
-                    st.rerun()
-                    break
             cap.release()
 
     st.markdown("---")
