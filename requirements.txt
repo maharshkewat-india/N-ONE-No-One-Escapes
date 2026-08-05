@@ -1,0 +1,7 @@
+streamlit==1.60.0
+opencv-python-headless==4.13.0.92
+numpy==2.4.4
+pandas==3.0.3
+Pillow==12.2.0
+deepface==0.0.100
+tf-keras==2.19.0
