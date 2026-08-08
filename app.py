@@ -15,8 +15,10 @@ from deepface_adapter import DEEPFACE_IMPORT_ERROR, DeepFace
 
 
 AUTH_SECRET_NAMES = (
-    "USER_USERNAME",
-    "USER_PASSWORD",
+    "ADMIN_USERNAME",
+    "ADMIN_PASSWORD",
+    "OPERATOR_USERNAME",
+    "OPERATOR_PASSWORD",
 )
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_LOCKOUT_SECONDS = 60
@@ -37,7 +39,7 @@ def _read_secret(name: str) -> str | None:
 
 
 def load_auth_credentials() -> dict[str, str]:
-    """Load required login credentials and fail closed when any are missing."""
+    """Load Admin and Operator credentials and fail closed when any are missing."""
     credentials = {name: _read_secret(name) for name in AUTH_SECRET_NAMES}
     missing = [name for name, value in credentials.items() if not value]
     if missing:
@@ -460,16 +462,53 @@ def configure_session_state() -> None:
         st.session_state.setdefault(key, value)
 
 
+def save_registered_profile(name: str, role_label: str, uploaded_file) -> bool:
+    """Save a face profile. This operation is available to Administrators only."""
+    if not name or not uploaded_file:
+        return False
+
+    prefix = "Lost" if "Lost" in role_label else "Member"
+    safe_name = "".join(
+        character if character.isalnum() else "_" for character in name
+    ).strip("_")
+    if not safe_name:
+        return False
+
+    destination = REG_DIR / f"{prefix}_{safe_name}.jpg"
+    with Image.open(uploaded_file) as image:
+        image.convert("RGB").save(destination)
+
+    load_known_face_encodings.clear()
+    load_known_face_encodings()
+    return True
+
+
+def clear_audit_log() -> None:
+    """Clear audit records. This operation is available to Administrators only."""
+    if CSV_LOG_PATH.exists():
+        CSV_LOG_PATH.unlink()
+    initialize_log_files()
+
+
+def clear_registered_profiles() -> None:
+    """Clear registered face profiles. This operation is available to Administrators only."""
+    for profile_path in REG_DIR.glob("*"):
+        if profile_path.is_file():
+            profile_path.unlink()
+    load_known_face_encodings.clear()
+
+
 def render_sidebar() -> None:
     st.sidebar.title("🔐 N-ONE Security Gate")
-    st.sidebar.caption("Least-privilege User access")
+    st.sidebar.caption("RBAC access control for surveillance ops")
 
     try:
         credentials = load_auth_credentials()
     except RuntimeError:
         st.sidebar.error("Authentication is unavailable: required secrets are not configured.")
         st.sidebar.caption(
-            "Configure USER_USERNAME and USER_PASSWORD in Streamlit Secrets "
+            "Configure ADMIN_USERNAME, ADMIN_PASSWORD, OPERATOR_USERNAME, and "
+            "OPERATOR_PASSWORD in Streamlit Secrets "
             "or the process environment."
         )
         return
@@ -483,8 +522,8 @@ def render_sidebar() -> None:
         st.sidebar.markdown(f"**Current Role:** {st.session_state.role}")
     else:
         st.sidebar.info("Login to access the command center.")
-        username = st.sidebar.text_input("Username")
-        password = st.sidebar.text_input("Password", type="password")
+        username = st.sidebar.text_input("Username", key="login_username")
+        password = st.sidebar.text_input("Password", type="password", key="login_password")
         if st.sidebar.button("Login", width='stretch'):
             now = time.monotonic()
             locked_until = st.session_state.get("login_locked_until", 0.0)
@@ -493,16 +532,23 @@ def render_sidebar() -> None:
                 st.sidebar.error(f"Too many failed attempts. Try again in {remaining} seconds.")
                 return
 
-            is_user = (
-                hmac.compare_digest(username, credentials["USER_USERNAME"])
-                and hmac.compare_digest(password, credentials["USER_PASSWORD"])
-            )
+            authenticated_role = None
+            if (
+                hmac.compare_digest(username, credentials["ADMIN_USERNAME"])
+                and hmac.compare_digest(password, credentials["ADMIN_PASSWORD"])
+            ):
+                authenticated_role = "Administrator"
+            elif (
+                hmac.compare_digest(username, credentials["OPERATOR_USERNAME"])
+                and hmac.compare_digest(password, credentials["OPERATOR_PASSWORD"])
+            ):
+                authenticated_role = "Operator"
 
-            if is_user:
+            if authenticated_role is not None:
                 st.session_state.login_attempts = 0
                 st.session_state.login_locked_until = 0.0
                 st.session_state.authenticated = True
-                st.session_state.role = "User"
+                st.session_state.role = authenticated_role
                 st.rerun()
             else:
                 st.session_state.login_attempts += 1
@@ -512,6 +558,91 @@ def render_sidebar() -> None:
                     st.sidebar.error("Too many failed attempts. Login is locked for 60 seconds.")
                 else:
                     st.sidebar.error("Invalid credentials.")
+
+    if st.session_state.role == "Administrator":
+        st.sidebar.markdown("---")
+        st.sidebar.header("Administrator controls")
+        with st.sidebar.form("registration_form"):
+            reg_name = st.text_input("Full Name / Identifier")
+            reg_role = st.selectbox(
+                "Classification Role",
+                ["Lost Person / Victim", "Registered Member / Staff"],
+            )
+            uploaded_photo = st.file_uploader(
+                "Upload Clear Face Photo", type=["jpg", "jpeg", "png"]
+            )
+            submitted = st.form_submit_button("Save Profile")
+            if submitted:
+                if save_registered_profile(reg_name, reg_role, uploaded_photo):
+                    st.sidebar.success(f"Registered profile for {reg_name}")
+                    st.session_state.last_status = "Profile saved"
+                else:
+                    st.sidebar.error("Provide both name and photo.")
+
+        st.sidebar.markdown("---")
+        st.sidebar.header("AI Model Configuration")
+        with st.sidebar.expander("DeepFace Settings", expanded=False):
+            st.session_state.selected_model = st.selectbox(
+                "Facial Recognition Model",
+                DEEPFACE_MODELS,
+                index=(
+                    DEEPFACE_MODELS.index(st.session_state.selected_model)
+                    if st.session_state.selected_model in DEEPFACE_MODELS
+                    else 0
+                ),
+                help="Choose the facial recognition model",
+            )
+            st.session_state.selected_backend = st.selectbox(
+                "Face Detection Backend",
+                DEEPFACE_BACKENDS,
+                index=(
+                    DEEPFACE_BACKENDS.index(st.session_state.selected_backend)
+                    if st.session_state.selected_backend in DEEPFACE_BACKENDS
+                    else 0
+                ),
+                help="Choose the face detection method",
+            )
+            st.session_state.selected_metric = st.selectbox(
+                "Similarity Metric",
+                DEEPFACE_METRICS,
+                index=(
+                    DEEPFACE_METRICS.index(st.session_state.selected_metric)
+                    if st.session_state.selected_metric in DEEPFACE_METRICS
+                    else 0
+                ),
+                help="Choose distance metric for comparison",
+            )
+            st.session_state.similarity_threshold = st.slider(
+                "Similarity Threshold",
+                min_value=0.0,
+                max_value=1.0,
+                value=st.session_state.similarity_threshold,
+                step=0.05,
+                help="Lower = more strict matching",
+            )
+
+        with st.sidebar.expander("Analysis Features", expanded=False):
+            st.session_state.enable_attributes = st.checkbox(
+                "Enable Facial Attributes (Age/Gender/Emotion/Race)",
+                value=st.session_state.enable_attributes,
+                help="Analyze demographic attributes",
+            )
+            st.session_state.enable_spoofing_detection = st.checkbox(
+                "Enable Anti-Spoofing Detection",
+                value=st.session_state.enable_spoofing_detection,
+                help="Detect face spoofing/liveness attacks",
+            )
+
+        st.sidebar.markdown("---")
+        st.sidebar.header("Admin Actions")
+        if st.sidebar.button(
+            "Clear All Registered Profiles", width="stretch", type="primary"
+        ):
+            clear_registered_profiles()
+            st.sidebar.success("All registered profiles deleted.")
+        if st.sidebar.button("Reset Full Audit Log", width="stretch", type="primary"):
+            clear_audit_log()
+            st.sidebar.success("Audit log reset.")
 
     return
 

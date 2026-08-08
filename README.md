@@ -32,11 +32,13 @@ pip install -r requirements.txt
 Configure the required login secrets outside the repository. For Streamlit Cloud, paste these values into **Advanced settings → Secrets**. Locally, set them in the process environment or create `.streamlit/secrets.toml` (which is ignored by Git).
 
 ```toml
-USER_USERNAME = "YOUR_USER_USERNAME_HERE"
-USER_PASSWORD = "YOUR_USER_PASSWORD_HERE"
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "YOUR_ADMIN_PASSWORD_HERE"
+OPERATOR_USERNAME = "operator"
+OPERATOR_PASSWORD = "YOUR_OPERATOR_PASSWORD_HERE"
 ```
 
-The application has no default credentials and will remain locked until both values are configured. The User account has read-only access to profiles/logs and can run test analysis, but cannot manage profiles, model settings, or audit data. Never commit real credentials.
+The application has no default credentials and will remain locked until all four values are configured. Administrators can manage profiles, model settings, and audit data. Operators can monitor, run analysis, and view logs without administrator controls. Never commit real credentials.
 
 ### 4. Running the Application
 
