@@ -4,6 +4,7 @@ import importlib
 import sys
 import cv2
 import numpy as np
+import pandas as pd
 from pathlib import Path
 from typing import Any, List, Dict, Optional
 
@@ -24,17 +25,23 @@ class OpenCVFaceBackend:
 
     def _init_opencv(self) -> None:
         """Initialize OpenCV face detection and recognition."""
+        # Face detection and LBPH recognition are independent capabilities.
+        # opencv-python-headless does not provide cv2.face, but it still
+        # provides the Haar cascade needed by the fallback detector.
         try:
-            # Use Haar cascade for face detection (built into OpenCV)
-            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
             self.face_cascade = cv2.CascadeClassifier(cascade_path)
-
-            # Initialize LBPH face recognizer (works without deep learning)
-            self.recognizer = cv2.face.LBPHFaceRecognizer_create()
-
-        except Exception as e:
-            self.error_message = f"OpenCV initialization error: {e}"
+            if self.face_cascade.empty():
+                self.face_cascade = None
+                self.error_message = "OpenCV Haar cascade could not be loaded."
+        except Exception as exc:
             self.face_cascade = None
+            self.error_message = f"OpenCV face-detector initialization error: {exc}"
+
+        try:
+            # Optional: not required by this adapter's embedding pipeline.
+            self.recognizer = cv2.face.LBPHFaceRecognizer_create()
+        except Exception:
             self.recognizer = None
 
     def detect_faces(self, img: np.ndarray) -> List[Dict]:
@@ -57,7 +64,33 @@ class OpenCVFaceBackend:
                 'facial_area': {'x': x, 'y': y, 'w': w, 'h': h},
                 'confidence': 1.0  # OpenCV doesn't provide confidence, use 1.0
             })
-        return results
+        return self._deduplicate_faces(results)
+
+    @staticmethod
+    def _deduplicate_faces(faces: List[Dict]) -> List[Dict]:
+        """Remove overlapping Haar detections for the same face."""
+        kept: List[Dict] = []
+        for candidate in sorted(
+            faces,
+            key=lambda item: item["facial_area"]["w"] * item["facial_area"]["h"],
+            reverse=True,
+        ):
+            box = candidate["facial_area"]
+            candidate_area = box["w"] * box["h"]
+            overlaps = False
+            for existing in kept:
+                other = existing["facial_area"]
+                left = max(box["x"], other["x"])
+                top = max(box["y"], other["y"])
+                right = min(box["x"] + box["w"], other["x"] + other["w"])
+                bottom = min(box["y"] + box["h"], other["y"] + other["h"])
+                overlap_area = max(0, right - left) * max(0, bottom - top)
+                if overlap_area / max(1, candidate_area) >= 0.35:
+                    overlaps = True
+                    break
+            if not overlaps:
+                kept.append(candidate)
+        return kept
 
     def extract_embedding(self, face_roi: np.ndarray) -> Optional[np.ndarray]:
         """Extract a simple feature vector from face ROI using histogram comparison."""
@@ -68,20 +101,23 @@ class OpenCVFaceBackend:
             else:
                 gray = face_roi
 
-            # Resize to fixed size for consistency
-            resized = cv2.resize(gray, (100, 100))
+            # Resize and equalize the face so the fallback has some spatial
+            # identity information instead of relying only on a global histogram.
+            resized = cv2.resize(gray, (64, 64))
+            normalized = cv2.equalizeHist(resized).astype(np.float32) / 255.0
+            spatial = normalized.flatten()
+            spatial = spatial - spatial.mean()
+            spatial /= np.linalg.norm(spatial) + 1e-8
 
-            # Extract HOG-like features or use histogram
-            hist = cv2.calcHist([resized], [0], None, [256], [0, 256])
-            hist = cv2.normalize(hist, hist).flatten()
+            # Add coarse gradient structure for edges such as eyes, nose, and jaw.
+            gradient_x = cv2.Sobel(normalized, cv2.CV_32F, 1, 0, ksize=3)
+            gradient_y = cv2.Sobel(normalized, cv2.CV_32F, 0, 1, ksize=3)
+            gradient = cv2.magnitude(gradient_x, gradient_y).flatten()
+            gradient /= np.linalg.norm(gradient) + 1e-8
 
-            # Also extract LBP-like texture features
-            lbp = self._compute_lbp(resized)
-            lbp_hist = cv2.calcHist([lbp], [0], None, [256], [0, 256])
-            lbp_hist = cv2.normalize(lbp_hist, lbp_hist).flatten()
-
-            # Combine features
-            embedding = np.concatenate([hist, lbp_hist])
+            # Combine features. This is only a dependency-free fallback; the
+            # real DeepFace backend remains preferred for production accuracy.
+            embedding = np.concatenate([spatial, gradient])
             return embedding.astype(np.float64)
 
         except Exception as e:
@@ -129,6 +165,20 @@ class OpenCVFaceBackend:
             if not faces and enforce_detection:
                 return []
 
+            # Unknown faces are stored as cropped face images. They may no
+            # longer contain enough surrounding context for Haar detection,
+            # so the find() path can explicitly use the whole crop.
+            if not faces and kwargs.get("allow_full_image", False):
+                height, width = img.shape[:2]
+                if min(height, width) >= 32:
+                    embedding = self.extract_embedding(img)
+                    if embedding is not None:
+                        return [{
+                            "embedding": embedding.tolist(),
+                            "facial_area": {"x": 0, "y": 0, "w": width, "h": height},
+                            "confidence": 1.0,
+                        }]
+
             results = []
             for face_info in faces:
                 # Extract face ROI
@@ -158,7 +208,13 @@ class OpenCVFaceBackend:
         """Find faces in database using OpenCV - mimics DeepFace.find interface."""
         try:
             # Load target image and get its embedding
-            target_representations = self.represent(img_path, model_name, enforce_detection, silent=True)
+            target_representations = self.represent(
+                img_path,
+                model_name,
+                enforce_detection,
+                silent=True,
+                allow_full_image=True,
+            )
             if not target_representations:
                 return [pd.DataFrame()]  # Return empty DataFrame in list to match DeepFace format
 
@@ -189,7 +245,13 @@ class OpenCVFaceBackend:
 
             for img_file in image_files:
                 try:
-                    db_representations = self.represent(str(img_file), model_name, False, silent=True)
+                    db_representations = self.represent(
+                        str(img_file),
+                        model_name,
+                        False,
+                        silent=True,
+                        allow_full_image=True,
+                    )
                     if db_representations:
                         db_embedding = np.array(db_representations[0]['embedding'])
 

@@ -194,15 +194,42 @@ def load_known_face_encodings():
         KNOWN_FACE_ENCODINGS.append({"name": name, "role": role, "encoding": embedding})
 
 
-def find_face_in_known_cache(face_encoding: list) -> dict | None:
-    """Finds a face in the in-memory cache of known encodings using cosine similarity."""
+def find_face_in_known_cache(
+    face_encoding: list, threshold: float = COSINE_THRESHOLD
+) -> dict | None:
+    """Return the closest known profile when it is inside the match threshold."""
+    best_match = None
+    best_distance = float("inf")
     for entry in KNOWN_FACE_ENCODINGS:
         if entry.get("encoding") is None:
             continue
         distance = cosine(np.array(face_encoding), np.array(entry["encoding"]))
-        if distance < COSINE_THRESHOLD:
-            return entry
-    return None
+        if distance < best_distance:
+            best_match = entry
+            best_distance = distance
+
+    if best_match is None or best_distance > threshold:
+        return None
+
+    return {**best_match, "distance": float(best_distance)}
+
+
+def record_detection_result(
+    result_type: str,
+    subject: str = "",
+    distance: float | None = None,
+    details: str = "",
+    image_name: str = "",
+) -> None:
+    """Store the latest recognition event for the live status panel."""
+    st.session_state.last_detection = {
+        "type": result_type,
+        "subject": subject,
+        "distance": distance,
+        "details": details,
+        "image_name": image_name,
+        "timestamp": time.strftime("%H:%M:%S"),
+    }
 
 
 def register_new_unknown(face_roi: np.ndarray, location: str, mode: str) -> str:
@@ -374,6 +401,7 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
             log_event(mode=mode, subject_id="System", role="N/A", event_type="Threat Detected", details="Contour analysis matched threat profile.")
         else:
             detection_summary = "No threats detected."
+        record_detection_result("no_threat", details=detection_summary)
         st.session_state.last_status = detection_summary
         return annotated_frame, detection_summary
 
@@ -385,16 +413,22 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
         )
     except Exception as e:
         st.session_state.last_status = f"DeepFace Error: {e}"
+        record_detection_result("error", details=f"Face analysis error: {e}")
         return annotated_frame, f"Error during face representation: {e}"
 
     if not face_objs:
         st.session_state.last_status = "No faces detected in frame."
+        record_detection_result("no_face", details="No face detected in the current frame.")
         return annotated_frame, "No faces detected in frame."
 
     detection_summary = f"Found {len(face_objs)} face(s), analyzing..."
     
     for face_obj in face_objs:
-        x, y, w, h = face_obj['facial_area'].values()
+        facial_area = face_obj["facial_area"]
+        x = int(facial_area["x"])
+        y = int(facial_area["y"])
+        w = int(facial_area["w"])
+        h = int(facial_area["h"])
         face_roi = frame[y : y + h, x : x + w]
         if face_roi.size == 0:
             continue
@@ -402,14 +436,24 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
         face_encoding = face_obj["embedding"]
 
         # Step A: Check against the KNOWN faces in-memory cache
-        known_match = find_face_in_known_cache(face_encoding)
+        match_threshold = float(
+            st.session_state.get("similarity_threshold", COSINE_THRESHOLD)
+        )
+        known_match = find_face_in_known_cache(face_encoding, match_threshold)
         if known_match:
             name, role = known_match["name"], known_match["role"]
+            distance = known_match["distance"]
             color = (0, 255, 0) if role == "Member" else (255, 0, 0)
             cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
             label = f"{role}: {name}"
             cv2.putText(annotated_frame, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            detection_summary = f"Matched: {label}"
+            detection_summary = f"Matched: {label} (distance {distance:.3f})"
+            record_detection_result(
+                "known_match",
+                subject=label,
+                distance=distance,
+                details="Matched against a registered profile.",
+            )
             log_event(mode=mode, subject_id=name, role=role, event_type="Known Face Match")
             continue
 
@@ -422,10 +466,20 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
                 enforce_detection=False, silent=True
             )
             if dfs and not dfs[0].empty:
-                match_path = Path(dfs[0].iloc[0]['identity'])
+                unknown_matches = dfs[0].sort_values("distance")
+                best_unknown = unknown_matches.iloc[0]
+                match_path = Path(best_unknown["identity"])
                 unknown_id = match_path.stem
+                distance = float(best_unknown.get("distance", 0.0))
                 update_unknown_sighting(unknown_id, "Main Feed", mode)
-                detection_summary = f"Re-identified: {unknown_id}"
+                detection_summary = f"Re-identified previous unknown: {unknown_id} (distance {distance:.3f})"
+                record_detection_result(
+                    "unknown_match",
+                    subject=unknown_id,
+                    distance=distance,
+                    details="Matched against a previously saved unknown face.",
+                    image_name=match_path.name,
+                )
                 color = (255, 165, 0) # Orange
                 cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
                 cv2.putText(annotated_frame, f"ID: {unknown_id}", (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
@@ -436,7 +490,13 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
         
         # Step C: If not known and not previously unknown, register as a NEW UNKNOWN
         unknown_id = register_new_unknown(face_roi, "Main Feed", mode)
-        detection_summary = f"New Unknown Registered: {unknown_id}"
+        detection_summary = f"No registered match - saved as new unknown: {unknown_id}"
+        record_detection_result(
+            "new_unknown",
+            subject=unknown_id,
+            details="No known or previous-unknown match; face image was saved.",
+            image_name=f"{unknown_id}.jpg",
+        )
         color = (255, 255, 0) # Cyan
         cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
         cv2.putText(annotated_frame, f"New ID: {unknown_id}", (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
@@ -444,11 +504,61 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
     st.session_state.last_status = detection_summary
     return annotated_frame, detection_summary
 
+
+def render_detection_result(container) -> None:
+    """Render a clear, human-readable result for the most recent face event."""
+    panel = container.container()
+    result = st.session_state.get("last_detection", {})
+    if not isinstance(result, dict):
+        panel.info(str(result))
+        return
+
+    result_type = result.get("type", "idle")
+    subject = result.get("subject", "")
+    distance = result.get("distance")
+    distance_text = f" | distance: {distance:.3f}" if distance is not None else ""
+    timestamp = result.get("timestamp", "")
+    details = result.get("details", "")
+
+    if result_type == "known_match":
+        panel.success(f"MATCH FOUND: {subject}{distance_text}")
+    elif result_type == "unknown_match":
+        panel.warning(f"PREVIOUS UNKNOWN MATCH: {subject}{distance_text}")
+    elif result_type == "new_unknown":
+        panel.warning(f"NO MATCH - SAVED AS NEW UNKNOWN: {subject}")
+    elif result_type == "no_face":
+        panel.info("NO FACE DETECTED")
+    elif result_type == "error":
+        panel.error(details or "Face analysis failed.")
+    elif result_type == "no_threat":
+        panel.info(details or "No threat detected.")
+    else:
+        panel.info(details or "Waiting for a detection result.")
+
+    if details and result_type not in {"error", "no_threat"}:
+        panel.caption(details)
+    if result.get("image_name"):
+        image_path = UNKNOWN_DIR / result["image_name"]
+        panel.caption(f"Saved/matched image: {result['image_name']}")
+        if image_path.exists():
+            panel.image(str(image_path), caption="Previous/saved unknown face", width="content")
+    if timestamp:
+        panel.caption(f"Last event: {timestamp}")
+
+
 def configure_session_state() -> None:
     defaults = {
         "authenticated": False, "role": "Guest", "streaming": False,
         "last_frame": None, "last_status": "Idle",
-        "last_detection": "No detections yet", "last_logged_event": "",
+        "last_detection": {
+            "type": "idle",
+            "subject": "",
+            "distance": None,
+            "details": "No detections yet.",
+            "image_name": "",
+            "timestamp": "",
+        },
+        "last_logged_event": "",
         "active_alerts": [],
         "login_attempts": 0, "login_locked_until": 0.0,
         "selected_model": DEEPFACE_MODEL,
@@ -694,6 +804,8 @@ def render_main_ui() -> None:
 
     st.markdown("---")
     status_area = st.empty()
+    match_area = st.empty()
+    render_detection_result(match_area)
     frame_placeholder = st.empty()
 
     if st.session_state.streaming and video_target is not None:
@@ -715,6 +827,7 @@ def render_main_ui() -> None:
                 
                 status_text = st.session_state.get('last_status', "Idle")
                 status_area.info(f"Last Status: {status_text}")
+                render_detection_result(match_area)
                 final_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
                 frame_placeholder.image(final_frame, width='stretch')
                 
