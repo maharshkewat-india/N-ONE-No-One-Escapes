@@ -16,7 +16,7 @@ Follow these steps to get the N-ONE platform running on your local machine.
 
 ```bash
 # Clone the repository (replace with your actual repository URL)
-git clone https://github.com/your-username/n-one.git
+git clone https://github.com/maharshkewat-india/N-ONE-No-One-Escapes.git
 cd n-one
 
 # It is highly recommended to use a virtual environment
