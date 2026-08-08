@@ -256,11 +256,9 @@ pytest tests/test_deepface_adapter.py --cov=deepface_adapter --cov-report=term-m
 ### 5.1 Required Environment Variables
 
 ```bash
-# .env.example (referenced in code)
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=admin123
-OPERATOR_USERNAME=operator
-OPERATOR_PASSWORD=op123
+# Required authentication secrets (configure outside the repository)
+USER_USERNAME=YOUR_USER_USERNAME_HERE
+USER_PASSWORD=YOUR_USER_PASSWORD_HERE
 ```
 
 ### 5.2 Validation Checks
@@ -370,9 +368,9 @@ The `OpenCVFaceBackend` class in `deepface_adapter.py` implements:
 
 ### 9.1 Authentication
 
-- Admin credentials loaded from environment variables (not hardcoded)
-- Operator credentials loaded from environment variables
-- Session-based authentication with role management
+- User credentials loaded from environment variables or Streamlit Secrets (not hardcoded)
+- Single least-privilege User role
+- Session-based authentication with login-attempt lockout
 
 ### 9.2 Privacy
 
@@ -481,10 +479,8 @@ from deepface_adapter import (
 pip install -r requirements.txt
 
 # 2. Set environment variables
-export ADMIN_USERNAME=admin
-export ADMIN_PASSWORD=admin123
-export OPERATOR_USERNAME=operator
-export OPERATOR_PASSWORD=op123
+export USER_USERNAME=YOUR_USER_USERNAME_HERE
+export USER_PASSWORD=YOUR_USER_PASSWORD_HERE
 
 # 3. Run the application
 python app.py

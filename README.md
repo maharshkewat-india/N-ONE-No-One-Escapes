@@ -29,15 +29,14 @@ pip install -r requirements.txt
 
 ### 3. Configuration
 
-Create a `.env` file in the root directory and add the following credentials for user authentication.
+Configure the required login secrets outside the repository. For Streamlit Cloud, paste these values into **Advanced settings → Secrets**. Locally, set them in the process environment or create `.streamlit/secrets.toml` (which is ignored by Git).
 
-```bash
-# .env
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=admin123
-OPERATOR_USERNAME=operator
-OPERATOR_PASSWORD=op123
+```toml
+USER_USERNAME = "YOUR_USER_USERNAME_HERE"
+USER_PASSWORD = "YOUR_USER_PASSWORD_HERE"
 ```
+
+The application has no default credentials and will remain locked until both values are configured. The User account has read-only access to profiles/logs and can run test analysis, but cannot manage profiles, model settings, or audit data. Never commit real credentials.
 
 ### 4. Running the Application
 
@@ -46,14 +45,46 @@ OPERATOR_PASSWORD=op123
 streamlit run app.py
 ```
 
+#### Windows: `streamlit` is not recognized
+
+If PowerShell shows an error such as:
+
+```text
+streamlit : The term 'streamlit' is not recognized...
+```
+
+PowerShell cannot find Streamlit in the active Python environment. From the project directory, run Streamlit through the project's virtual environment:
+
+```powershell
+# Recommended: run without activating the environment
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+Alternatively, activate the virtual environment first:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+streamlit run app.py
+```
+
+If PowerShell blocks the activation script, allow it for the current terminal session and try again:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+streamlit run app.py
+```
+
+The first command is the safest option because it directly uses the project's installed dependencies.
+
 ## 2. ADVANTAGES OF THE PROPOSED SYSTEM & LIMITATIONS
 
 ### Advantages:
 *   **Multi-Modal Surveillance:** Seamless integration of lost person tracking, member attendance logging, and threat detection within a single, unified platform.
 *   **High-Accuracy Facial Recognition:** Utilizes DeepFace with robust backends (Facenet/ArcFace) to ensure high precision in identifying individuals, minimizing false positives and negatives.
 *   **Dynamic Video Ingestion:** Supports diverse video sources including laptop webcams, pre-recorded files, and IP camera RTSP/TCP streams, offering deployment flexibility.
-*   **Intuitive User Interface:** A modern dark UI dashboard built with Streamlit provides an accessible and efficient operational experience for both administrators and operators.
-*   **Role-Based Access Control (RBAC):** Ensures secure operation with distinct access levels for Admin and Operator roles, enhancing system integrity and data protection.
+*   **Intuitive User Interface:** A modern dark UI dashboard built with Streamlit provides an accessible and efficient operational experience for authenticated users.
+*   **Least-Privilege User Access:** A single User role can run analysis and view results without profile-management or destructive controls.
 *   **Comprehensive Audit & Logging:** Real-time CSV logging and downloadable interactive data tables facilitate thorough post-event analysis, compliance, and operational transparency.
 *   **Proactive Threat Detection:** Incorporates heuristic/contour analysis and deep learning models for early detection of hazardous objects and weapons, significantly improving security posture.
 *   **Persistent Unknown Person Tracking:** Automatically registers, logs, and re-identifies unknown individuals in attendance mode, building a database of all persons sighted.
@@ -71,7 +102,7 @@ Current surveillance systems often lack the integration and intelligence require
 ## 4. OBJECTIVES
 The primary objectives of the N-ONE platform are:
 *   To design and implement a multi-mode AI surveillance system capable of dynamically switching between lost person tracking, member attendance logging, and threat detection functionalities.
-*   To develop a secure Role-Based Access Control (RBAC) gateway to differentiate between administrative and operational privileges, ensuring system integrity and data security.
+*   To provide a secure User authentication gate with least-privilege access, ensuring system integrity and data security.
 *   To integrate high-accuracy facial recognition capabilities using the DeepFace framework (Facenet/ArcFace backends) for reliable subject identification and embedding extraction.
 *   To enable versatile video feed ingestion from various sources, including laptop webcams, recorded video files, and real-time IP camera RTSP/TCP streams.
 *   To construct a Subject Profile Registration Engine for secure enrollment and management of target individuals (lost persons) and authorized personnel.
@@ -99,7 +130,7 @@ Weapon detection research has similarly benefited from deep learning, moving bey
 | **Threat Detection**         | Simple motion detection, basic contour analysis, human-dependent | **Advanced AI:** Heuristic/contour + deep model detection of weapons               |
 | **Video Ingestion**          | Limited to specific camera types, often proprietary formats | **Dynamic & Versatile:** Laptop Webcam, Recorded Files, RTSP/TCP IP Cameras         |
 | **User Interface**           | Often clunky, desktop-only, or dated web interfaces        | **Modern Streamlit UI:** Intuitive, dark-themed, web-based dashboard              |
-| **Access Control**           | Basic user accounts, often lacking granular permissions    | **Role-Based Access Control (RBAC):** Admin & Operator roles with distinct privileges |
+| **Access Control**           | Basic user accounts, often lacking granular permissions    | **Least-Privilege User Role:** Analysis and read-only monitoring access               |
 | **Audit & Logging**          | Manual review of footage, simple event logs, non-structured | **Structured Audit & Logging Engine:** Real-time CSV, interactive data tables     |
 | **Scalability (initial)**    | Limited by hardware and software integration complexity    | Designed for modularity; extensible for diverse environments (requires resources) |
 | **Deployment Complexity**    | Often vendor-locked, complex setup and configuration       | Python-based, leverages open-source libraries, simpler deployment for developers |
@@ -136,32 +167,31 @@ graph TD
     F2 --> H
 
     H --> I[Streamlit Dashboard (Modern Dark UI)]
-    J[RBAC Gateway] --> I
-    J --> K[Subject Profile Registration Engine (Admin Only)]
+    J[User Authentication] --> I
+    J --> K[Pre-registered Profiles (Offline)]
     K --> G1
 
     I -- User Interaction --> D
-    I -- User Interaction --> K
-    I -- Admin/Operator --> J
+    I -- Authenticated User --> J
 ```
 
 ### Module Workflow Breakdown:
 
-1.  **RBAC Gateway (Role-Based Access Control):**
-    *   **Function:** Authenticates users and authorizes access based on predefined roles (Admin, Operator).
-    *   **Workflow:** User attempts to access system -> RBAC Gateway verifies credentials and role -> Grants appropriate access levels to UI features and modules (e.g., Admin can register subjects, Operators can monitor).
+1.  **User Authentication Gate:**
+    *   **Function:** Authenticates one least-privilege User account from environment variables or Streamlit Secrets.
+    *   **Workflow:** User attempts to access the system -> the authentication gate verifies credentials -> the User receives analysis, monitoring, and read-only log access.
 
-2.  **Subject Profile Registration Engine (Admin Module):**
-    *   **Function:** Admin-only module for enrolling new subjects (lost persons, staff, members) into the system's database.
-    *   **Workflow:** Admin uploads subject image/video -> System extracts facial embeddings (via DeepFace) -> Stores embeddings and metadata in a secure database -> New subject becomes trackable.
+2.  **Pre-registered Profile Preparation (Offline):**
+    *   **Function:** Profile preparation is kept outside the User-facing application.
+    *   **Workflow:** Deployment owners prepare approved profile data before testing; User accounts cannot create, modify, or delete profiles.
 
 3.  **Dynamic Video Feed Ingestion:**
     *   **Function:** Decodes and processes video streams from multiple sources.
     *   **Workflow:** User selects video source (Webcam, File, RTSP URL) -> RTSP/TCP decoders or OpenCV video capture module initiates stream -> Frames are extracted and buffered for downstream processing.
 
 4.  **Dynamic UI-Driven Mode Selector:**
-    *   **Function:** Allows the operator to switch between operational modes.
-    *   **Workflow:** Operator selects desired mode via Streamlit UI -> System configures the processing pipeline to activate specific AI models and logic corresponding to the chosen mode.
+    *   **Function:** Allows the User to switch between operational modes.
+    *   **Workflow:** User selects a desired mode via Streamlit UI -> the processing pipeline activates the corresponding detection workflow.
 
 5.  **Mode 1: Lost Person Search (Target Alert Mode):**
     *   **Function:** Continuously scans video feeds for a specific pre-registered target.
@@ -188,7 +218,7 @@ graph TD
 
 10. **Streamlit Dashboard (Modern Dark UI):**
     *   **Function:** Provides the central interactive interface for system control, monitoring, and data visualization.
-    *   **Workflow:** Receives processed data and alerts from various modules -> Renders real-time video feeds with overlays, alerts, and statistical summaries -> Allows user interaction for mode selection, subject registration (for Admin), and log retrieval.
+    *   **Workflow:** Receives processed data and alerts from various modules -> Renders real-time video feeds with overlays, alerts, and statistical summaries -> Allows User interaction for mode selection, analysis, and read-only log retrieval.
 
 ## 7. FEASIBILITY STUDY
 
