@@ -7,11 +7,15 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
+from scipy.spatial.distance import cosine
 
-try:
-    from deepface import DeepFace
-except Exception:  # pragma: no cover - optional dependency path
-    DeepFace = None
+from deepface_adapter import DEEPFACE_IMPORT_ERROR, DeepFace
+
+if DEEPFACE_IMPORT_ERROR:
+    st.warning(
+        "DeepFace runtime is not fully available in this environment. "
+        f"The app will continue with a safe fallback. Error: {DEEPFACE_IMPORT_ERROR}"
+    )
 
 st.set_page_config(
     page_title="PROJECT N-ONE | Advanced AI Surveillance Platform",
@@ -40,146 +44,170 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# --- Constants and Paths ---
 ROOT_DIR = Path(__file__).resolve().parent
 REG_DIR = ROOT_DIR / "registered_faces"
 LOG_DIR = ROOT_DIR / "detection_logs"
-CSV_LOG_PATH = LOG_DIR / "system_audit_logs.csv"
-TEMP_FRAME_PATH = ROOT_DIR / "temp_current_frame.jpg"
-TEMP_VIDEO_PATH = ROOT_DIR / "temp_video_upload.mp4"
 UNKNOWN_DIR = ROOT_DIR / "unknown_faces"
+CSV_LOG_PATH = LOG_DIR / "system_audit_logs.csv"
+TEMP_VIDEO_PATH = ROOT_DIR / "temp_video_upload.mp4"
 UNKNOWN_DB_PATH = ROOT_DIR / "unknown_person_db.csv"
 UNKNOWN_SIGHTING_LOG_PATH = ROOT_DIR / "unknown_sighting_log.csv"
 
-# In-memory cache for face encodings and tracking
+# DeepFace Model Configuration
+DEEPFACE_MODELS = ["VGG-Face", "Facenet", "Facenet512", "OpenFace", "DeepFace", "ArcFace", "SFace"]
+DEEPFACE_BACKENDS = ["opencv", "mtcnn", "retinaface", "mediapipe", "dlib", "ssd", "yolov8n", "yunet"]
+DEEPFACE_METRICS = ["cosine", "euclidean", "euclidean_l2"]
+ATTRIBUTE_TASKS = ["age", "gender", "emotion", "race"]
+
+# Default Configuration
+DEEPFACE_MODEL = "Facenet"
+DEEPFACE_BACKEND = "opencv"
+DEEPFACE_METRIC = "cosine"
+COSINE_THRESHOLD = 0.40
+
+# --- In-memory Cache ---
 KNOWN_FACE_ENCODINGS = []
-UNKNOWN_FACE_ENCODINGS = []
-FACE_CANDIDATES = {}  # { 'encoding': [timestamp, sightings] }
-MAX_CANDIDATE_AGE = 5  # seconds
-MIN_CANDIDATE_SIGHTINGS = 3 # times seen
 
 
 def initialize_directories() -> None:
+    """Create necessary directories if they don't exist."""
     REG_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
     UNKNOWN_DIR.mkdir(exist_ok=True)
 
 
-def initialize_log_file() -> None:
-    if not CSV_LOG_PATH.exists():
-        pd.DataFrame(columns=["Timestamp", "Mode", "Subject_Name", "Role", "Event_Status"]).to_csv(
-            CSV_LOG_PATH,
-            index=False,
+def initialize_log_files() -> None:
+    """Create log files with headers if they don't exist."""
+    if not CSV_LOG_PATH.exists() or CSV_LOG_PATH.stat().st_size == 0:
+        pd.DataFrame(columns=["Timestamp", "Mode", "Subject_ID", "Role", "Event_Type", "Details"]).to_csv(
+            CSV_LOG_PATH, index=False
         )
-    if not UNKNOWN_DB_PATH.exists():
+    if not UNKNOWN_DB_PATH.exists() or UNKNOWN_DB_PATH.stat().st_size == 0:
         pd.DataFrame(
             columns=["unknown_id", "image_path", "first_seen_timestamp", "last_seen_timestamp", "last_known_location", "assigned_name"]
         ).to_csv(UNKNOWN_DB_PATH, index=False)
-    else:
-        try:
-            df = pd.read_csv(UNKNOWN_DB_PATH)
-            if "assigned_name" not in df.columns:
-                df["assigned_name"] = ""
-                df.to_csv(UNKNOWN_DB_PATH, index=False)
-        except pd.errors.EmptyDataError:
-             pd.DataFrame(
-                columns=["unknown_id", "image_path", "first_seen_timestamp", "last_seen_timestamp", "last_known_location", "assigned_name"]
-            ).to_csv(UNKNOWN_DB_PATH, index=False)
-
-    if not UNKNOWN_SIGHTING_LOG_PATH.exists():
+    if not UNKNOWN_SIGHTING_LOG_PATH.exists() or UNKNOWN_SIGHTING_LOG_PATH.stat().st_size == 0:
         pd.DataFrame(columns=["sighting_id", "unknown_id", "timestamp", "location"]).to_csv(
             UNKNOWN_SIGHTING_LOG_PATH, index=False
         )
 
 
+def log_event(mode: str, subject_id: str, role: str, event_type: str, details: str = "") -> None:
+    """Logs a single surveillance event to the main audit CSV."""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    new_log_entry = pd.DataFrame(
+        [[timestamp, mode, subject_id, role, event_type, details]],
+        columns=["Timestamp", "Mode", "Subject_ID", "Role", "Event_Type", "Details"],
+    )
+    new_log_entry.to_csv(CSV_LOG_PATH, mode="a", header=False, index=False)
+    st.session_state.last_logged_event = f"{timestamp} - {event_type}: {subject_id}"
+
+
 def get_next_unknown_id() -> str:
+    """Generates the next sequential ID for a new unknown person."""
     if not UNKNOWN_DB_PATH.exists() or pd.read_csv(UNKNOWN_DB_PATH).empty:
         return "unknown_001"
     db_df = pd.read_csv(UNKNOWN_DB_PATH)
     if db_df.empty:
         return "unknown_001"
     last_id = db_df["unknown_id"].max()
-    if not isinstance(last_id, str):
-         return "unknown_001"
+    if not isinstance(last_id, str) or not last_id.startswith("unknown_"):
+        return "unknown_001"
     last_num = int(last_id.split("_")[-1])
     return f"unknown_{last_num + 1:03d}"
 
 
+def get_registered_profile_count() -> int:
+    """Return the number of saved profiles visible to the dashboard."""
+    if KNOWN_FACE_ENCODINGS:
+        return len(KNOWN_FACE_ENCODINGS)
+
+    profile_files = [
+        img_path
+        for img_path in REG_DIR.glob("*.*")
+        if img_path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    ]
+    return len(profile_files)
+
+
 @st.cache_resource
-def load_all_face_encodings():
-    """Loads all known and unknown face encodings into memory."""
+def load_known_face_encodings():
+    """Loads all known face encodings from the registration directory into memory."""
     if DeepFace is None:
         return
 
-    # Load known faces
     KNOWN_FACE_ENCODINGS.clear()
-    for img_path in REG_DIR.glob("*.jpg"):
+    for img_path in REG_DIR.glob("*.*"):
+        if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+            continue
+
+        name = img_path.stem.split("_", 1)[-1]
+        role = "Lost" if img_path.stem.startswith("Lost") else "Member"
+        embedding = None
         try:
-            name = img_path.stem.split("_", 1)[-1]
-            role = "Lost" if img_path.stem.startswith("Lost") else "Member"
-            embedding = DeepFace.represent(
-                img_path=str(img_path), model_name="Facenet", enforce_detection=False
+            embedding_obj = DeepFace.represent(
+                img_path=str(img_path), model_name=DEEPFACE_MODEL, enforce_detection=False
             )
-            if embedding and len(embedding) > 0:
-                 KNOWN_FACE_ENCODINGS.append({"name": name, "role": role, "encoding": embedding[0]["embedding"]})
+            if embedding_obj and len(embedding_obj) > 0:
+                embedding = embedding_obj[0].get("embedding")
         except Exception as e:
             st.warning(f"Could not process {img_path.name}: {e}")
 
-    # Load unknown faces
-    UNKNOWN_FACE_ENCODINGS.clear()
-    for img_path in UNKNOWN_DIR.glob("*.jpg"):
-        try:
-            unknown_id = img_path.stem
-            embedding = DeepFace.represent(
-                img_path=str(img_path), model_name="Facenet", enforce_detection=False
-            )
-            if embedding and len(embedding) > 0:
-                UNKNOWN_FACE_ENCODINGS.append({"id": unknown_id, "encoding": embedding[0]["embedding"]})
-        except Exception:
-            # st.warning(f"Could not load encoding for {img_path.name}: {e}")
-            pass # Avoid spamming warnings if an image is corrupted
+        KNOWN_FACE_ENCODINGS.append({"name": name, "role": role, "encoding": embedding})
 
 
-def find_face_in_cache(face_encoding: list, cache: list, tolerance=0.40) -> dict | None:
-    """Finds a face in a given cache of encodings."""
-    for entry in cache:
-        distance = np.linalg.norm(np.array(face_encoding) - np.array(entry["encoding"]))
-        if distance < tolerance:
+def find_face_in_known_cache(face_encoding: list) -> dict | None:
+    """Finds a face in the in-memory cache of known encodings using cosine similarity."""
+    for entry in KNOWN_FACE_ENCODINGS:
+        if entry.get("encoding") is None:
+            continue
+        distance = cosine(np.array(face_encoding), np.array(entry["encoding"]))
+        if distance < COSINE_THRESHOLD:
             return entry
     return None
 
 
-def register_new_unknown(face_roi: np.ndarray, face_encoding: list, location: str) -> str:
-    """Registers a new unknown person and updates the in-memory cache."""
+def register_new_unknown(face_roi: np.ndarray, location: str, mode: str) -> str:
+    """Registers a new unknown person, saves their image, logs the event, and updates the DB."""
     unknown_id = get_next_unknown_id()
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     image_path = UNKNOWN_DIR / f"{unknown_id}.jpg"
+    
     cv2.imwrite(str(image_path), face_roi)
 
     new_person_df = pd.DataFrame(
         [[unknown_id, str(image_path), timestamp, timestamp, location, ""]],
         columns=["unknown_id", "image_path", "first_seen_timestamp", "last_seen_timestamp", "last_known_location", "assigned_name"],
     )
-    header = not UNKNOWN_DB_PATH.exists() or UNKNOWN_DB_PATH.stat().st_size == 0
-    new_person_df.to_csv(UNKNOWN_DB_PATH, mode="a", header=header, index=False)
+    new_person_df.to_csv(UNKNOWN_DB_PATH, mode="a", header=False, index=False)
 
     log_sighting(unknown_id, timestamp, location)
-
-    # Update in-memory cache
-    UNKNOWN_FACE_ENCODINGS.append({"id": unknown_id, "encoding": face_encoding})
+    log_event(mode=mode, subject_id=unknown_id, role="Unknown", event_type="New Unknown Detected")
     
+    # Re-build the representations file for the unknown directory
+    if (UNKNOWN_DIR / "representations_facenet.pkl").exists():
+        (UNKNOWN_DIR / "representations_facenet.pkl").unlink()
+    DeepFace.find(img_path=str(image_path), db_path=str(UNKNOWN_DIR), model_name=DEEPFACE_MODEL, distance_metric=DEEPFACE_METRIC)
+
     return unknown_id
 
 
 def log_sighting(unknown_id: str, timestamp: str, location: str) -> None:
-    sighting_df = pd.read_csv(UNKNOWN_SIGHTING_LOG_PATH)
-    sighting_id = len(sighting_df) + 1
+    """Adds a record to the sighting log for an unknown person."""
+    try:
+        sighting_id = (pd.read_csv(UNKNOWN_SIGHTING_LOG_PATH)["sighting_id"].max() + 1)
+    except (FileNotFoundError, pd.errors.EmptyDataError, ValueError):
+        sighting_id = 1
+
     new_sighting_df = pd.DataFrame(
         [[sighting_id, unknown_id, timestamp, location]], columns=["sighting_id", "unknown_id", "timestamp", "location"]
     )
     new_sighting_df.to_csv(UNKNOWN_SIGHTING_LOG_PATH, mode="a", header=False, index=False)
 
 
-def update_unknown_sighting(unknown_id: str, location: str) -> str:
+def update_unknown_sighting(unknown_id: str, location: str, mode: str) -> None:
+    """Updates the last seen timestamp/location for an unknown person and logs the event."""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         db_df = pd.read_csv(UNKNOWN_DB_PATH)
@@ -187,103 +215,92 @@ def update_unknown_sighting(unknown_id: str, location: str) -> str:
         db_df.loc[db_df["unknown_id"] == unknown_id, "last_known_location"] = location
         db_df.to_csv(UNKNOWN_DB_PATH, index=False)
         log_sighting(unknown_id, timestamp, location)
-        last_seen = db_df.loc[db_df["unknown_id"] == unknown_id, "first_seen_timestamp"].iloc[0]
-        return last_seen
+        log_event(mode=mode, subject_id=unknown_id, role="Unknown", event_type="Re-identified")
     except (FileNotFoundError, pd.errors.EmptyDataError, IndexError):
-        return "N/A"
+        pass
 
 
-def tag_unknown_person(unknown_id: str, assigned_name: str) -> bool:
-    if not UNKNOWN_DB_PATH.exists():
-        return False
-    db_df = pd.read_csv(UNKNOWN_DB_PATH)
-    if unknown_id not in db_df["unknown_id"].values:
-        return False
-    db_df.loc[db_df["unknown_id"] == unknown_id, "assigned_name"] = assigned_name
-    db_df.to_csv(UNKNOWN_DB_PATH, index=False)
-    return True
+def analyze_facial_attributes(frame: np.ndarray, face_objs: list) -> list[dict]:
+    """Analyze facial attributes (age, gender, emotion, race) for detected faces."""
+    attributes_list = []
+    if DeepFace is None:
+        return attributes_list
+    
+    try:
+        analysis = DeepFace.analyze(
+            img_path=frame, enforce_detection=False, silent=True
+        )
+        if isinstance(analysis, list):
+            attributes_list = analysis
+    except Exception as e:
+        pass
+    
+    return attributes_list
 
 
-def log_event(mode: str, name: str, role: str, status: str) -> None:
-    row = pd.DataFrame(
-        [[time.strftime("%Y-%m-%d %H:%M:%S"), mode, name, role, status]],
-        columns=["Timestamp", "Mode", "Subject_Name", "Role", "Event_Status"],
-    )
-    row.to_csv(CSV_LOG_PATH, mode="a", header=False, index=False)
+def extract_and_align_faces(frame: np.ndarray) -> list[np.ndarray]:
+    """Extract and align faces from the frame."""
+    aligned_faces = []
+    if DeepFace is None:
+        return aligned_faces
+    
+    try:
+        extracted = DeepFace.extract_faces(
+            img_path=frame, enforce_detection=False, silent=True
+        )
+        if isinstance(extracted, list):
+            aligned_faces = [face.get("face") for face in extracted if "face" in face]
+    except Exception as e:
+        pass
+    
+    return aligned_faces
 
 
-def configure_session_state() -> None:
-    defaults = {
-        "authenticated": False,
-        "role": "Guest",
-        "streaming": False,
-        "last_frame": None,
-        "last_status": "Idle",
-        "last_detection": "No detections yet",
-        "last_detection_details": "No details available",
-        "last_logged_event": "",
-        "last_match_snapshot": None,
-        "last_match_caption": "",
-        "active_alerts": []
-    }
-    for key, value in defaults.items():
-        st.session_state.setdefault(key, value)
+def verify_face_pair(img1_path: str, img2_path: str, model: str = DEEPFACE_MODEL) -> dict:
+    """Verify if two face images belong to the same person (1-to-1 matching)."""
+    if DeepFace is None:
+        return {"verified": False, "distance": 1.0, "threshold": 0.4}
+    
+    try:
+        result = DeepFace.verify(
+            img1_path=img1_path, img2_path=img2_path,
+            model_name=model, enforce_detection=False, silent=True
+        )
+        return result
+    except Exception as e:
+        return {"verified": False, "distance": 1.0, "threshold": 0.4, "error": str(e)}
 
 
-def clear_registered_profiles() -> None:
-    if not REG_DIR.exists():
-        return
-    for image_file in REG_DIR.glob("*"):
-        if image_file.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
-            image_file.unlink()
-    load_all_face_encodings.clear()
+def detect_spoofing(frame: np.ndarray) -> dict:
+    """Detect face spoofing/liveness attacks using anti-spoofing model."""
+    if DeepFace is None:
+        return {"is_real": True, "confidence": 0.0}
+    
+    try:
+        result = DeepFace.detect_spoofing(
+            img_path=frame, detector_backend="opencv", silent=True
+        )
+        return result
+    except Exception as e:
+        return {"is_real": True, "confidence": 0.0, "error": str(e)}
 
 
-def clear_audit_log() -> None:
-    pd.DataFrame(columns=["Timestamp", "Mode", "Subject_Name", "Role", "Event_Status"]).to_csv(
-        CSV_LOG_PATH,
-        index=False,
-    )
-
-
-def save_registered_profile(name: str, role_label: str, uploaded_file) -> bool:
-    if not name or not uploaded_file:
-        return False
-    prefix = "Lost" if "Lost" in role_label else "Member"
-    safe_name = "_".join(name.split())
-    destination = REG_DIR / f"{prefix}_{safe_name}.jpg"
-    with Image.open(uploaded_file) as img:
-        img = img.convert("RGB")
-        img.save(destination)
-    load_all_face_encodings.clear()
-    return True
-
-
-@st.cache_resource
-def load_face_cascade():
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    return cv2.CascadeClassifier(cascade_path)
-
-
-def capture_match_snapshot(face_roi, name: str, role: str):
-    if face_roi is None or face_roi.size == 0:
-        return None
-    snapshot = face_roi.copy()
-    color = (0, 255, 0) if role == "Member" else (0, 0, 255)
-    cv2.rectangle(snapshot, (0, 0), (snapshot.shape[1] - 1, snapshot.shape[0] - 1), color, 2)
-    cv2.putText(
-        snapshot,
-        f"{role}: {name}",
-        (8, 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        color,
-        2,
-    )
-    return cv2.cvtColor(snapshot, cv2.COLOR_BGR2RGB)
+def get_face_embeddings(frame: np.ndarray, model: str = DEEPFACE_MODEL) -> list:
+    """Get facial embeddings for faces in the frame."""
+    if DeepFace is None:
+        return []
+    
+    try:
+        embeddings = DeepFace.represent(
+            img_path=frame, model_name=model, enforce_detection=False, silent=True
+        )
+        return embeddings if isinstance(embeddings, list) else []
+    except Exception as e:
+        return []
 
 
 def check_weapon_contours(frame) -> tuple[bool, list[tuple[int, int, int, int]]]:
+    """Heuristic-based weapon contour detection."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (7, 7), 0)
     edges = cv2.Canny(blur, 50, 150)
@@ -302,38 +319,43 @@ def check_weapon_contours(frame) -> tuple[bool, list[tuple[int, int, int, int]]]
     return threat_found, boxes
 
 
-def process_frame(frame, mode: str) -> tuple[np.ndarray, str]:
+def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
+    """The core processing pipeline for each video frame."""
     annotated_frame = frame.copy()
-    detection_summary = "No detections"
+    detection_summary = "Status: Idle"
 
-    # --- Threat Detection (Always On) ---
-    if "3. Threat" in mode:
+    is_face_rec_mode = "Threat" not in mode
+    
+    # --- 1. Threat Detection (Exclusive Mode) ---
+    if not is_face_rec_mode:
         threat_detected, boxes = check_weapon_contours(annotated_frame)
         if threat_detected:
             for x, y, w, h in boxes:
                 cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
                 cv2.putText(annotated_frame, "THREAT ALERT", (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            detection_summary = "Threat contour heuristic alert"
-            st.session_state.last_status = detection_summary
-            alert_id = f"threat-{time.time()}"
-            new_alert = {"id": alert_id, "type": "Threat", "message": "Potential weapon detected."}
-            if not any(a['type'] == 'Threat' for a in st.session_state.active_alerts):
-                 st.session_state.active_alerts.append(new_alert)
-            return annotated_frame, detection_summary
+            detection_summary = "Threat contour heuristic alert!"
+            log_event(mode=mode, subject_id="System", role="N/A", event_type="Threat Detected", details="Contour analysis matched threat profile.")
+        else:
+            detection_summary = "No threats detected."
+        st.session_state.last_status = detection_summary
+        return annotated_frame, detection_summary
 
-    # --- Face Detection & Recognition ---
+    # --- 2. Face Detection & Recognition (For all other modes) ---
     try:
-        face_objs = DeepFace.represent(frame, enforce_detection=False, detector_backend='opencv')
+        face_objs = DeepFace.represent(
+            img_path=frame, model_name=DEEPFACE_MODEL,
+            enforce_detection=False, detector_backend='opencv'
+        )
     except Exception as e:
-        # This can happen if no faces are found and deepface errors out
-        return annotated_frame, "No faces detected in frame."
+        st.session_state.last_status = f"DeepFace Error: {e}"
+        return annotated_frame, f"Error during face representation: {e}"
 
     if not face_objs:
-        return annotated_frame, "No faces detected"
+        st.session_state.last_status = "No faces detected in frame."
+        return annotated_frame, "No faces detected in frame."
 
-    st.session_state.last_status = f"Found {len(face_objs)} face(s), matching..."
+    detection_summary = f"Found {len(face_objs)} face(s), analyzing..."
     
-    face_found_in_frame = False
     for face_obj in face_objs:
         x, y, w, h = face_obj['facial_area'].values()
         face_roi = frame[y : y + h, x : x + w]
@@ -341,409 +363,394 @@ def process_frame(frame, mode: str) -> tuple[np.ndarray, str]:
             continue
             
         face_encoding = face_obj["embedding"]
-        face_found_in_frame = True
 
-        # 1. Check against KNOWN faces
-        known_match = find_face_in_cache(face_encoding, KNOWN_FACE_ENCODINGS)
+        # Step A: Check against the KNOWN faces in-memory cache
+        known_match = find_face_in_known_cache(face_encoding)
         if known_match:
             name, role = known_match["name"], known_match["role"]
-            color = (0, 255, 0) if role == "Member" else (0, 0, 255)
+            color = (0, 255, 0) if role == "Member" else (255, 0, 0)
             cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
-            cv2.putText(annotated_frame, f"{role}: {name}", (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            detection_summary = f"Matched: {role} {name}"
-            
-            st.session_state.last_match_snapshot = capture_match_snapshot(face_roi, name, role)
-            st.session_state.last_match_caption = f"{role}: {name}"
-            if "1. Lost Person" in mode and role == "Lost":
-                alert_id = f"lost-{name}-{time.time()}"
-                new_alert = {"id": alert_id, "type": "Lost Person", "message": f"Lost person '{name}' has been located."}
-                if not any(a.get('message') == new_alert.get('message') for a in st.session_state.active_alerts):
-                    st.session_state.active_alerts.append(new_alert)
+            label = f"{role}: {name}"
+            cv2.putText(annotated_frame, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            detection_summary = f"Matched: {label}"
+            log_event(mode=mode, subject_id=name, role=role, event_type="Known Face Match")
             continue
 
-        # 2. Check against UNKNOWN faces (only in attendance mode)
-        if "2. Member Attendance" in mode:
-            unknown_match = find_face_in_cache(face_encoding, UNKNOWN_FACE_ENCODINGS)
-            if unknown_match:
-                unknown_id = unknown_match["id"]
-                first_seen = update_unknown_sighting(unknown_id, "Main Feed")
-                detection_summary = f"Re-identified: ID {unknown_id}"
-                cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (255, 165, 0), 2)
-                cv2.putText(annotated_frame, f"ID: {unknown_id}", (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
-                cv2.putText(annotated_frame, f"First Seen: {first_seen}", (x, max(0, y - 28)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 165, 0), 1)
+        # Step B: If not a known face, check against the UNKNOWN database on disk
+        try:
+            # Use DeepFace.find against the unknown faces directory. This is faster if DB is large.
+            dfs = DeepFace.find(
+                img_path=face_roi, db_path=str(UNKNOWN_DIR),
+                model_name=DEEPFACE_MODEL, distance_metric=DEEPFACE_METRIC,
+                enforce_detection=False, silent=True
+            )
+            if dfs and not dfs[0].empty:
+                match_path = Path(dfs[0].iloc[0]['identity'])
+                unknown_id = match_path.stem
+                update_unknown_sighting(unknown_id, "Main Feed", mode)
+                detection_summary = f"Re-identified: {unknown_id}"
+                color = (255, 165, 0) # Orange
+                cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(annotated_frame, f"ID: {unknown_id}", (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
                 continue
+        except Exception:
+             # This can fail if UNKNOWN_DIR is empty, which is fine on first run.
+             pass
+        
+        # Step C: If not known and not previously unknown, register as a NEW UNKNOWN
+        unknown_id = register_new_unknown(face_roi, "Main Feed", mode)
+        detection_summary = f"New Unknown Registered: {unknown_id}"
+        color = (255, 255, 0) # Cyan
+        cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
+        cv2.putText(annotated_frame, f"New ID: {unknown_id}", (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
 
-            # 3. Handle as a new CANDIDATE face
-            candidate_match_key = None
-            # Find a matching candidate in the temporary buffer
-            for candidate_encoding_tuple, (ts, sightings) in FACE_CANDIDATES.items():
-                distance = np.linalg.norm(np.array(face_encoding) - np.array(candidate_encoding_tuple))
-                if distance < 0.5: # Use a slightly more lenient tolerance for candidates
-                    candidate_match_key = candidate_encoding_tuple
-                    break
-            
-            current_time = time.time()
-            if candidate_match_key:
-                # If a candidate is found, update its timestamp and sightings count
-                FACE_CANDIDATES[candidate_match_key][0] = current_time
-                FACE_CANDIDATES[candidate_match_key][1] += 1
-                sightings = FACE_CANDIDATES[candidate_match_key][1]
-                detection_summary = f"Tracking candidate... ({sightings}/{MIN_CANDIDATE_SIGHTINGS})"
-                
-                # If candidate seen enough times, promote to a new unknown person
-                if sightings >= MIN_CANDIDATE_SIGHTINGS:
-                    unknown_id = register_new_unknown(face_roi, list(candidate_match_key), "Main Feed")
-                    detection_summary = f"New Unknown Registered: {unknown_id}"
-                    del FACE_CANDIDATES[candidate_match_key] # Remove from candidates
-            else:
-                # If no matching candidate, add this new face as a candidate
-                FACE_CANDIDATES[tuple(face_encoding)] = [current_time, 1]
-                detection_summary = "New face candidate spotted."
-
-            cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (255, 255, 0), 1)
-            cv2.putText(annotated_frame, "Candidate", (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
-
-    # Clean up old candidates that haven't been seen recently
-    current_time = time.time()
-    expired_candidates = [key for key, (ts, _) in FACE_CANDIDATES.items() if current_time - ts > MAX_CANDIDATE_AGE]
-    for key in expired_candidates:
-        if key in FACE_CANDIDATES:
-             del FACE_CANDIDATES[key]
-
-    if face_found_in_frame:
-        st.session_state.last_status = detection_summary
-    
+    st.session_state.last_status = detection_summary
     return annotated_frame, detection_summary
 
+def configure_session_state() -> None:
+    defaults = {
+        "authenticated": False, "role": "Guest", "streaming": False,
+        "last_frame": None, "last_status": "Idle",
+        "last_detection": "No detections yet", "last_logged_event": "",
+        "active_alerts": [],
+        "selected_model": DEEPFACE_MODEL,
+        "selected_backend": DEEPFACE_BACKEND,
+        "selected_metric": DEEPFACE_METRIC,
+        "enable_attributes": True,
+        "enable_spoofing_detection": False,
+        "similarity_threshold": COSINE_THRESHOLD,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+def save_registered_profile(name: str, role_label: str, uploaded_file) -> bool:
+    if not name or not uploaded_file:
+        return False
+    prefix = "Lost" if "Lost" in role_label else "Member"
+    safe_name = "".join(c if c.isalnum() else "_" for c in name)
+    destination = REG_DIR / f"{prefix}_{safe_name}.jpg"
+    with Image.open(uploaded_file) as img:
+        img = img.convert("RGB")
+        img.save(destination)
+    load_known_face_encodings.clear()
+    load_known_face_encodings()
+    return True
+
+
+def clear_audit_log() -> None:
+    if CSV_LOG_PATH.exists():
+        CSV_LOG_PATH.unlink()
+    initialize_log_files()
+
+def clear_registered_profiles() -> None:
+    for f in REG_DIR.glob("*"): f.unlink()
+    load_known_face_encodings.clear()
 
 def render_sidebar() -> None:
     st.sidebar.title("🔐 N-ONE Security Gate")
-    st.sidebar.caption("RBAC access control for surveillance operations")
-    # ... (rest of sidebar remains the same)
+    st.sidebar.caption("RBAC access control for surveillance ops")
+
+    # --- Securely load credentials ---
+    ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
+    ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "admin123")
+    OPERATOR_USER = os.getenv("OPERATOR_USERNAME", "operator")
+    OPERATOR_PASS = os.getenv("OPERATOR_PASSWORD", "op123")
+    
     if st.session_state.authenticated:
-        if st.sidebar.button("🔒 Logout System", use_container_width=True):
+        if st.sidebar.button("🔒 Logout System", width='stretch'):
+            st.session_state.streaming = False
             st.session_state.authenticated = False
             st.session_state.role = "Guest"
-            st.session_state.streaming = False
             st.rerun()
         st.sidebar.markdown(f"**Current Role:** {st.session_state.role}")
     else:
+        st.sidebar.info("Login to access the command center. For first-time use, default credentials are provided in `.env.example`.")
         username = st.sidebar.text_input("Username")
         password = st.sidebar.text_input("Password", type="password")
-        if st.sidebar.button("Login", use_container_width=True):
-            if username == "admin" and password == "admin123":
+        if st.sidebar.button("Login", width='stretch'):
+            if username == ADMIN_USER and password == ADMIN_PASS:
                 st.session_state.authenticated = True
                 st.session_state.role = "Administrator"
-                st.session_state.streaming = False
                 st.rerun()
-            elif username == "operator" and password == "op123":
+            elif username == OPERATOR_USER and password == OPERATOR_PASS:
                 st.session_state.authenticated = True
                 st.session_state.role = "Operator"
-                st.session_state.streaming = False
                 st.rerun()
             else:
-                st.sidebar.error("Invalid credentials. Try admin/admin123 or operator/op123.")
-        st.sidebar.warning("Authentication required to start surveillance.")
+                st.sidebar.error("Invalid credentials.")
 
     st.sidebar.markdown("---")
     if st.session_state.role == "Administrator":
         st.sidebar.header("👤 Registration Module")
-        reg_name = st.sidebar.text_input("Full Name / Identifier", key="reg_name")
-        reg_role = st.sidebar.selectbox(
-            "Classification Role",
-            ["Lost Person / Victim", "Registered Member / Staff"],
-            key="reg_role",
-        )
-        uploaded_photo = st.sidebar.file_uploader("Upload Clear Face Photo", type=["jpg", "jpeg", "png"], key="reg_photo")
-        if st.sidebar.button("💾 Save Profile", use_container_width=True):
-            if save_registered_profile(reg_name, reg_role, uploaded_photo):
-                st.sidebar.success(f"Registered profile for {reg_name}")
-                st.session_state.last_status = "Profile saved"
-                load_all_face_encodings() # Reload cache
-            else:
-                st.sidebar.error("Provide both a name and a photo before saving.")
-        if st.sidebar.button("🧹 Clear Registered Profiles", use_container_width=True):
+        with st.form("registration_form"):
+            reg_name = st.text_input("Full Name / Identifier")
+            reg_role = st.selectbox("Classification Role", ["Lost Person / Victim", "Registered Member / Staff"])
+            uploaded_photo = st.file_uploader("Upload Clear Face Photo", type=["jpg", "jpeg", "png"])
+            submitted = st.form_submit_button("💾 Save Profile")
+            if submitted:
+                if save_registered_profile(reg_name, reg_role, uploaded_photo):
+                    st.sidebar.success(f"Registered profile for {reg_name}")
+                    st.session_state.last_status = "Profile saved"
+                else:
+                    st.sidebar.error("Provide both name and photo.")
+        
+        st.sidebar.markdown("---")
+        st.sidebar.header("⚙️ AI Model Configuration")
+        with st.sidebar.expander("🔧 DeepFace Settings", expanded=False):
+            st.session_state.selected_model = st.selectbox(
+                "Facial Recognition Model",
+                DEEPFACE_MODELS,
+                index=DEEPFACE_MODELS.index(st.session_state.selected_model) if st.session_state.selected_model in DEEPFACE_MODELS else 0,
+                help="Choose the facial recognition model"
+            )
+            st.session_state.selected_backend = st.selectbox(
+                "Face Detection Backend",
+                DEEPFACE_BACKENDS,
+                index=DEEPFACE_BACKENDS.index(st.session_state.selected_backend) if st.session_state.selected_backend in DEEPFACE_BACKENDS else 0,
+                help="Choose the face detection method"
+            )
+            st.session_state.selected_metric = st.selectbox(
+                "Similarity Metric",
+                DEEPFACE_METRICS,
+                index=DEEPFACE_METRICS.index(st.session_state.selected_metric) if st.session_state.selected_metric in DEEPFACE_METRICS else 0,
+                help="Choose distance metric for comparison"
+            )
+            st.session_state.similarity_threshold = st.slider(
+                "Similarity Threshold",
+                min_value=0.0, max_value=1.0, value=st.session_state.similarity_threshold,
+                step=0.05, help="Lower = more strict matching"
+            )
+        
+        with st.sidebar.expander("📊 Analysis Features", expanded=False):
+            st.session_state.enable_attributes = st.checkbox(
+                "Enable Facial Attributes (Age/Gender/Emotion/Race)",
+                value=st.session_state.enable_attributes,
+                help="Analyze demographic attributes"
+            )
+            st.session_state.enable_spoofing_detection = st.checkbox(
+                "Enable Anti-Spoofing Detection",
+                value=st.session_state.enable_spoofing_detection,
+                help="Detect face spoofing/liveness attacks"
+            )
+        
+        st.sidebar.markdown("---")
+        st.sidebar.header("⚠️ Admin Actions")
+        if st.sidebar.button("🧹 Clear All Registered Profiles", width='stretch', type="primary"):
             clear_registered_profiles()
             st.sidebar.success("All registered profiles deleted.")
-            st.session_state.last_status = "Registered profiles cleared"
-            load_all_face_encodings() # Reload cache
-        if st.sidebar.button("📄 Reset Audit Log", use_container_width=True):
+        if st.sidebar.button("📄 Reset Full Audit Log", width='stretch', type="primary"):
             clear_audit_log()
             st.sidebar.success("Audit log reset.")
-            st.session_state.last_status = "Audit log reset"
-    else:
-        st.sidebar.info("Registration is restricted to administrators.")
+
 
 
 def render_main_ui() -> None:
     st.title("🎯 N-ONE COMMAND CENTER")
-    st.markdown("### Mission Control for AI Surveillance, Target Tracking, and Threat Detection")
-
-    if st.session_state.active_alerts:
-        st.markdown("<h2 style='color: #ef4444;'>🚨 CRITICAL ALERTS</h2>", unsafe_allow_html=True)
-        alerts_to_keep = []
-        for alert in st.session_state.active_alerts:
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                st.error(f"**{alert['type']}:** {alert['message']}")
-            with col2:
-                if st.button(f"Dismiss {alert['id'][-4:]}", key=f"dismiss_{alert['id']}"):
-                    pass
-                else:
-                    alerts_to_keep.append(alert)
-        st.session_state.active_alerts = alerts_to_keep
-        st.markdown("---")
-        
-    st.markdown("---")
 
     st.subheader("⚙️ Operational Console")
     col_ctrl1, col_ctrl2 = st.columns(2)
-    with col_ctrl1:
-        mode = st.selectbox(
-            "Select Active Surveillance Mode",
-            [
-                "1. Lost Person Search (Target Alert Mode)",
-                "2. Member Attendance Logger (Known vs Unknown)",
-                "3. Threat & Weapon Detection Mode",
-            ],
-            key="selected_mode",
-        )
-    with col_ctrl2:
-        source_type = st.radio(
-            "Select Video Input Source",
-            ["Laptop Webcam", "Recorded Video File", "IP Camera Stream"],
-            horizontal=True,
-            key="input_source",
-        )
+    mode = col_ctrl1.selectbox(
+        "Select Active Surveillance Mode",
+        ["1. Lost Person Search", "2. Member Attendance Logger", "3. Threat Detection Mode"],
+        key="selected_mode", help="Select the primary mission for the AI."
+    )
+    source_type = col_ctrl2.radio(
+        "Select Video Input Source",
+        ["Laptop Webcam", "Recorded Video File", "IP Camera Stream"],
+        horizontal=True, key="input_source"
+    )
 
     video_target = None
     if source_type == "Laptop Webcam":
         video_target = 0
     elif source_type == "Recorded Video File":
-        uploaded_video = st.file_uploader("Upload Video File (.mp4 / .avi / .mov)", type=["mp4", "avi", "mov"], key="video_upload")
-        if uploaded_video is not None:
+        uploaded_video = st.file_uploader("Upload Video File", type=["mp4", "avi", "mov"])
+        if uploaded_video:
             TEMP_VIDEO_PATH.write_bytes(uploaded_video.getbuffer())
             video_target = str(TEMP_VIDEO_PATH)
     elif source_type == "IP Camera Stream":
-        rtsp_url = st.text_input("Enter RTSP / HTTP Camera Stream URL", key="rtsp_url")
-        if rtsp_url:
-            video_target = rtsp_url
+        video_target = st.text_input("Enter RTSP / HTTP Stream URL", placeholder="rtsp://...")
 
     st.markdown("---")
+    log_df = pd.read_csv(CSV_LOG_PATH) if CSV_LOG_PATH.exists() and CSV_LOG_PATH.stat().st_size > 0 else pd.DataFrame()
+    unk_df = pd.read_csv(UNKNOWN_DB_PATH) if UNKNOWN_DB_PATH.exists() and UNKNOWN_DB_PATH.stat().st_size > 0 else pd.DataFrame()
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    col_m1.metric("Active Role", st.session_state.role)
+    col_m2.metric("Registered Profiles", get_registered_profile_count())
+    col_m3.metric("Unknowns Logged", len(unk_df))
+    col_m4.metric("Total Log Events", len(log_df))
 
-    log_df = pd.read_csv(CSV_LOG_PATH) if CSV_LOG_PATH.exists() else pd.DataFrame()
-    col_metric1, col_metric2, col_metric3 = st.columns(3)
-    col_metric1.metric("Active RBAC Role", st.session_state.role)
-    col_metric2.metric("Registered Profiles", len(KNOWN_FACE_ENCODINGS))
-    col_metric3.metric("Log Entries", len(log_df))
-
-    st.markdown("---")
-    button_label = "🟢 Surveillance: On" if st.session_state.streaming else "🔴 Surveillance: Off"
-    if st.button(button_label, use_container_width=True):
-        st.session_state.streaming = not st.session_state.streaming
-        st.session_state.last_status = "Streaming started" if st.session_state.streaming else "Streaming stopped"
-        st.rerun()
+    button_label = "Stop Surveillance" if st.session_state.streaming else "Start Surveillance"
+    if st.button(button_label, width='stretch', type="primary" if not st.session_state.streaming else "secondary"):
+        if not st.session_state.streaming and video_target is None:
+            st.error("Cannot start stream: no valid video source selected.")
+        else:
+            st.session_state.streaming = not st.session_state.streaming
+            st.rerun()
 
     st.markdown("---")
     status_area = st.empty()
-    status_text = st.session_state.get('last_status', "Idle")
-    if "Matching" in status_text or "candidate" in status_text:
-        status_area.info(status_text)
-    elif "Threat" in status_text or "alert" in status_text.lower():
-        status_area.error(status_text)
-    else:
-        status_area.success(status_text)
-    
     frame_placeholder = st.empty()
-    if st.session_state.last_frame is None:
-        frame_placeholder.info("Camera feed will appear here after the stream starts.")
-    else:
-        frame_placeholder.image(st.session_state.last_frame, channels="RGB", use_container_width=True)
 
-    if st.session_state.authenticated and st.session_state.streaming and video_target is not None:
+    if st.session_state.streaming and video_target is not None:
         cap = cv2.VideoCapture(video_target)
         if not cap.isOpened():
-            st.error("Unable to open the requested source.")
+            st.error(f"Error: Could not open video source.")
             st.session_state.streaming = False
         else:
-            while st.session_state.streaming and cap.isOpened():
+            while st.session_state.streaming:
                 ret, frame = cap.read()
                 if not ret:
                     st.session_state.streaming = False
-                    st.session_state.last_status = "Stream disconnected"
+                    st.warning("Video stream ended or file finished.")
+                    cap.release()
+                    st.rerun()
                     break
-
+                
                 annotated_frame, detection_summary = process_frame(frame, mode)
-                st.session_state.last_detection = detection_summary
-                st.session_state.last_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                frame_placeholder.image(st.session_state.last_frame, channels="RGB", use_container_width=True)
+                
+                status_text = st.session_state.get('last_status', "Idle")
+                status_area.info(f"Last Status: {status_text}")
+                final_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                frame_placeholder.image(final_frame, width='stretch')
+                
+                time.sleep(0.01)
 
-                time.sleep(0.08) # Control frame rate
+        if cap.isOpened():
             cap.release()
+    else:
+        frame_placeholder.info("Surveillance feed is offline. Select a source and start the stream.")
 
+
+def render_facial_analytics_panel() -> None:
+    """Render facial analytics and verification tools."""
+    st.markdown("---")
+    st.subheader("🔬 Facial Analytics & Verification Tools")
+    
+    analytics_tab1, analytics_tab2, analytics_tab3 = st.tabs(
+        ["Face Comparison", "Batch Analysis", "Detection Tuning"]
+    )
+    
+    with analytics_tab1:
+        st.write("**1-to-1 Face Verification**")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            uploaded_img1 = st.file_uploader("Upload First Face Image", type=["jpg", "jpeg", "png"], key="verify_img1")
+        with col2:
+            uploaded_img2 = st.file_uploader("Upload Second Face Image", type=["jpg", "jpeg", "png"], key="verify_img2")
+        
+        if uploaded_img1 and uploaded_img2 and st.button("Verify Match"):
+            temp_path1 = ROOT_DIR / "temp_verify_1.jpg"
+            temp_path2 = ROOT_DIR / "temp_verify_2.jpg"
+            
+            with Image.open(uploaded_img1) as img:
+                img.convert("RGB").save(temp_path1)
+            with Image.open(uploaded_img2) as img:
+                img.convert("RGB").save(temp_path2)
+            
+            result = verify_face_pair(str(temp_path1), str(temp_path2), st.session_state.selected_model)
+            
+            col_result1, col_result2, col_result3 = st.columns(3)
+            col_result1.metric("Match Status", "✅ MATCH" if result.get("verified") else "❌ NO MATCH")
+            col_result2.metric("Distance", f"{result.get('distance', 0):.4f}")
+            col_result3.metric("Threshold", f"{result.get('threshold', 0):.4f}")
+            
+            if not result.get("verified"):
+                st.warning("Faces do not match with current threshold settings.")
+            else:
+                st.success("Faces successfully verified as the same person!")
+            
+            temp_path1.unlink(missing_ok=True)
+            temp_path2.unlink(missing_ok=True)
+    
+    with analytics_tab2:
+        st.write("**Batch Facial Attribute Analysis**")
+        uploaded_batch = st.file_uploader("Upload Image for Analysis", type=["jpg", "jpeg", "png"], key="batch_analysis")
+        
+        if uploaded_batch and st.button("Analyze Attributes"):
+            temp_image = ROOT_DIR / "temp_analysis.jpg"
+            with Image.open(uploaded_batch) as img:
+                img.convert("RGB").save(temp_image)
+            
+            analysis_results = analyze_facial_attributes(cv2.imread(str(temp_image)), [])
+            
+            if analysis_results:
+                for idx, result in enumerate(analysis_results):
+                    st.write(f"**Face #{idx + 1}**")
+                    col_a1, col_a2, col_a3, col_a4 = st.columns(4)
+                    col_a1.metric("Age", f"{result.get('age', 'N/A')} yrs")
+                    col_a2.metric("Gender", result.get('dominant_gender', 'N/A'))
+                    col_a3.metric("Emotion", result.get('dominant_emotion', 'N/A'))
+                    col_a4.metric("Race", result.get('dominant_race', 'N/A'))
+            else:
+                st.info("No faces detected or attribute analysis unavailable.")
+            
+            temp_image.unlink(missing_ok=True)
+    
+    with analytics_tab3:
+        st.write("**Detection Model Tuning**")
+        st.info("Adjust settings in the sidebar to tune detection performance.")
+        
+        col_tune1, col_tune2 = st.columns(2)
+        with col_tune1:
+            st.write("**Current Model Settings:**")
+            st.code(f"""
+Model: {st.session_state.selected_model}
+Backend: {st.session_state.selected_backend}
+Metric: {st.session_state.selected_metric}
+Threshold: {st.session_state.similarity_threshold:.2f}
+            """)
+        
+        with col_tune2:
+            st.write("**Features Enabled:**")
+            features = []
+            if st.session_state.enable_attributes:
+                features.append("✓ Facial Attributes")
+            if st.session_state.enable_spoofing_detection:
+                features.append("✓ Anti-Spoofing")
+            if features:
+                st.write("\n".join(features))
+            else:
+                st.write("No additional features enabled")
+
+
+def render_log_viewer() -> None:
     st.markdown("---")
     st.subheader("📊 Structured Audit & Detection Logs")
-    # ... (rest of UI remains the same)
-    if CSV_LOG_PATH.exists():
-        log_df = pd.read_csv(CSV_LOG_PATH)
+    if CSV_LOG_PATH.exists() and CSV_LOG_PATH.stat().st_size > 0:
+        log_df = pd.read_csv(CSV_LOG_PATH).sort_values(by="Timestamp", ascending=False)
+        st.dataframe(log_df, width='stretch', height=300)
+    else:
+        st.info("No audit logs recorded yet.")
 
-        with st.expander("🔍 Filter Audit Logs", expanded=False):
-            col_filter1, col_filter2 = st.columns(2)
-            with col_filter1:
-                log_start_date = st.date_input("Start date", None, key="audit_start_date")
-                log_end_date = st.date_input("End date", None, key="audit_end_date")
-            with col_filter2:
-                search_term = st.text_input("Search by keyword (name, role, event)", key="audit_search")
-
-        filtered_log_df = log_df.copy()
-        if log_start_date and log_end_date:
-            filtered_log_df["Timestamp"] = pd.to_datetime(filtered_log_df["Timestamp"])
-            start_date_ts = pd.to_datetime(log_start_date)
-            end_date_ts = pd.to_datetime(log_end_date)
-            filtered_log_df = filtered_log_df[(filtered_log_df['Timestamp'].dt.date >= start_date_ts.date()) & (filtered_log_df['Timestamp'].dt.date <= end_date_ts.date())]
-
-        if search_term:
-            filtered_log_df = filtered_log_df[
-                filtered_log_df["Subject_Name"].str.contains(search_term, case=False, na=False) |
-                filtered_log_df["Role"].str.contains(search_term, case=False, na=False) |
-                filtered_log_df["Event_Status"].str.contains(search_term, case=False, na=False)
-            ]
-
-        st.dataframe(filtered_log_df, use_container_width=True)
-        st.download_button(
-            label="📥 Download Filtered Audit Logs (CSV)",
-            data=filtered_log_df.to_csv(index=False).encode("utf-8"),
-            file_name="filtered_n_one_surveillance_logs.csv",
-            mime="text/csv",
-        )
-
-    st.subheader("🕵️ Unknown & Re-Identified Person Logs")
-
-    with st.expander("🔍 Filter Unknown Person Logs", expanded=False):
-        col_ufilter1, col_ufilter2 = st.columns(2)
-        with col_ufilter1:
-            unknown_search_term = st.text_input("Search by Unknown ID", key="unknown_search")
-        with col_ufilter2:
-            sighting_start_date = st.date_input("Sighting start date", None, key="sighting_start_date")
-            sighting_end_date = st.date_input("Sighting end date", None, key="sighting_end_date")
-
-
-    col_unknown1, col_unknown2 = st.columns(2)
-    with col_unknown1:
-        st.markdown("**Unknown Persons Database**")
-        if UNKNOWN_DB_PATH.exists():
-            try:
-                unknown_df = pd.read_csv(UNKNOWN_DB_PATH)
-                if not unknown_df.empty:
-                    filtered_unknown_df = unknown_df.copy()
-
-                    if sighting_start_date and sighting_end_date:
-                        filtered_unknown_df["last_seen_timestamp"] = pd.to_datetime(
-                            filtered_unknown_df["last_seen_timestamp"]
-                        )
-                        start_date_ts = pd.to_datetime(sighting_start_date)
-                        end_date_ts = pd.to_datetime(sighting_end_date)
-                        filtered_unknown_df = filtered_unknown_df[
-                            (filtered_unknown_df["last_seen_timestamp"].dt.date >= start_date_ts.date())
-                            & (filtered_unknown_df["last_seen_timestamp"].dt.date <= end_date_ts.date())
-                        ]
-
-                    if unknown_search_term:
-                        filtered_unknown_df = filtered_unknown_df[
-                            filtered_unknown_df["unknown_id"].str.contains(unknown_search_term, case=False, na=False)
-                        ]
-
-                    st.dataframe(filtered_unknown_df, use_container_width=True)
-                else:
-                    st.info("Unknown person database is currently empty.")
-            except pd.errors.EmptyDataError:
-                st.info("Unknown person database is currently empty.")
-            
-    with col_unknown2:
-        st.markdown("**Sighting Log for Unknowns**")
-        if UNKNOWN_SIGHTING_LOG_PATH.exists():
-            sighting_df = pd.read_csv(UNKNOWN_SIGHTING_LOG_PATH)
-            filtered_sighting_df = sighting_df.copy()
-            
-            if sighting_start_date and sighting_end_date:
-                filtered_sighting_df["timestamp"] = pd.to_datetime(filtered_sighting_df["timestamp"])
-                start_date_ts = pd.to_datetime(sighting_start_date)
-                end_date_ts = pd.to_datetime(sighting_end_date)
-                filtered_sighting_df = filtered_sighting_df[(filtered_sighting_df['timestamp'].dt.date >= start_date_ts.date()) & (filtered_sighting_df['timestamp'].dt.date <= end_date_ts.date())]
-
-            if unknown_search_term:
-                filtered_sighting_df = filtered_sighting_df[filtered_sighting_df["unknown_id"].str.contains(unknown_search_term, case=False, na=False)]
-                
-            st.dataframe(filtered_sighting_df, use_container_width=True)
-
-    if st.session_state.role == "Administrator":
-        with st.expander("✏️ Tag an Unknown Person", expanded=False):
-            untagged_ids = []
-            if UNKNOWN_DB_PATH.exists():
-                try:
-                    unknown_df = pd.read_csv(UNKNOWN_DB_PATH)
-                    untagged_df = unknown_df[unknown_df["assigned_name"].isnull() | (unknown_df["assigned_name"] == "")]
-                    if not untagged_df.empty:
-                        untagged_ids = untagged_df["unknown_id"].tolist()
-                except pd.errors.EmptyDataError:
-                    pass
-
-            if not untagged_ids:
-                st.info("No untagged unknown persons available to label.")
-            else:
-                with st.form("tagging_form"):
-                    tag_id = st.selectbox("Select Unknown ID to tag", options=untagged_ids)
-                    tag_name = st.text_input("Assign a name/tag (e.g., 'Regular Courier')")
-                    submitted = st.form_submit_button("Save Tag")
-                    if submitted:
-                        if tag_id and tag_name:
-                            if tag_unknown_person(tag_id, tag_name):
-                                st.success(f"Successfully tagged {tag_id} as '{tag_name}'.")
-                                st.rerun()
-                            else:
-                                st.error(f"Failed to tag {tag_id}. Check if the ID exists.")
-                        else:
-                            st.warning("Please select an ID and provide a name.")
-
-    with st.expander("🕵️‍♂️ Unknown Persons Gallery", expanded=False):
-        render_unknown_gallery()
-
-    st.caption(f"Status: {st.session_state.last_status} | {st.session_state.last_detection}")
-
-
-def render_unknown_gallery():
-    if not UNKNOWN_DB_PATH.exists() or pd.read_csv(UNKNOWN_DB_PATH).empty:
-        st.info("No unknown persons have been logged yet.")
-        return
-
-    st.markdown("A visual log of all unique unknown individuals detected by the system.")
-    unknown_df = pd.read_csv(UNKNOWN_DB_PATH)
-    
-    num_cols = 5  # Define number of columns for the gallery
-    cols = st.columns(num_cols)
-    
-    for index, row in unknown_df.iterrows():
-        col_index = index % num_cols
-        with cols[col_index]:
-            image_path_str = str(row["image_path"])
-            if Path(image_path_str).exists():
-                st.image(image_path_str, use_column_width=True)
-                st.caption(f"ID: {row['unknown_id']}")
-                st.caption(f"First Seen: {row['first_seen_timestamp']}")
-            else:
-                st.warning(f"ID: {row['unknown_id']}\n(Image not found)")
+    st.subheader("🕵️ Unknown Persons Database")
+    if UNKNOWN_DB_PATH.exists() and UNKNOWN_DB_PATH.stat().st_size > 0:
+        try:
+            unknown_df = pd.read_csv(UNKNOWN_DB_PATH).sort_values(by="last_seen_timestamp", ascending=False)
+            st.dataframe(unknown_df, width='stretch', height=300)
+        except pd.errors.EmptyDataError:
+            st.info("Unknown person database is empty.")
+    else:
+        st.info("No unknown persons recorded yet.")
 
 
 def main() -> None:
+    """Main function to run the Streamlit application."""
     initialize_directories()
-    initialize_log_file()
+    initialize_log_files()
     configure_session_state()
-    load_all_face_encodings()
+    
     render_sidebar()
-    if not st.session_state.authenticated:
-        st.warning("🔒 System locked. Authenticate from the sidebar to access the surveillance console.")
-        return
-    render_main_ui()
+    
+    if st.session_state.authenticated:
+        load_known_face_encodings()
+        render_main_ui()
+        render_facial_analytics_panel()
+        render_log_viewer()
+    else:
+        st.warning("🔒 System locked. Please authenticate via the sidebar.")
 
 
 if __name__ == "__main__":

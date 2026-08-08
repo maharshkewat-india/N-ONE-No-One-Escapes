@@ -1,20 +1,33 @@
+# --- Python & Virtual Environments ---
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
-*.log
-*.tmp
-*.temp
-*.jpg
-*.jpeg
-*.png
-*.bmp
-*.mp4
-*.avi
-*.mov
-registered_faces/
-detection_logs/
-venv/
 .env
 .venv
-.ipynb_checkpoints/
+env/
+venv/
+
+# --- IDE & OS Specific ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Testing & Coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- N-ONE Project: Logs & Generated Data ---
+# These directories and files are generated at runtime.
+*.log
+/detection_logs/
+/unknown_faces/
+/registered_faces/
+*.csv
+*.pkl
+
+# --- DeepFace: Model Weights & Cache ---
+# Model weights are downloaded automatically and should not be versioned.
+.deepface/

@@ -1,14 +1,15 @@
 # ARCHITECTURE.md
 
-## Component Architecture
+## Integrated Component Architecture (Update 2026-08-07)
 
 ```text
 +-------------------------+
 | Streamlit UI            |
 | - RBAC login            |
-| - registration module  |
-| - mode selector         |
-| - camera controls       |
+| - Registration module  |
+| - Mode selector         |
+| - Camera controls       |
+| - Settings panel        |
 +-----------+-------------+
             |
             v
@@ -16,48 +17,54 @@
 | Processing Layer        |
 | - OpenCV frame capture  |
 | - DeepFace matching     |
-| - contour heuristics    |
-| - status annotations    |
+| - Contour heuristics    |
+| - CASCADE_IAFACE_ANALYSIS|
+| - Status annotations    |
 +-----------+-------------+
             |
             v
 +-------------------------+
 | Storage Layer           |
-| - registered_faces/    |
-| - unknown_faces/       |
-| - detection_logs/      |
+| - registered_faces/     |
+| - unknown_faces/        |
+| - detection_logs/       |
 | - temp files            |
 +-------------------------+
 ```
 
-## Data Flow
+## Enhanced Data Flow
 
-1. User authenticates through the sidebar.
-2. The selected camera source is opened by OpenCV.
-3. Each frame is processed by the active surveillance mode.
-4. Matching results or threat contours are annotated on the frame. In "Member Attendance" mode, unknown faces are logged and re-identified.
-5. Events are appended to the CSV audit log and reflected in the UI.
+1. **Authentication Gate** → Sidebar RBAC enforces `Administrator`/`Operator` roles.
+2. **Camera & Mode Selection** → OpenCV captures frames based on user choice.
+3. **Cascaded Processing Pipeline**:
+   - **DeepFace Recognition** (configurable model/backend)
+   - **Contour Heuristics** for threat detection
+   - **Anti‑Spoofing Detection** (optional)
+   - **Facial Attribute Analysis** (age, gender, emotion, race)
+4. **Event Annotation** → Annotated frames returned to UI for real‑time feedback.
+5. **Persistent Logging** → All events appended to `detection_logs/system_audit_logs.csv`.
+6. **Unknown Person Handling** → Automated re‑identification and DB updates.
+7. **Configuration Management** → Sidebar settings control models, backends, thresholds, and feature toggles.
 
-## RBAC Permissions Matrix
-
-| Role | Login | Register Profiles | Start/Stop Stream | View Logs | Export Logs |
-|------|-------|-------------------|-------------------|-----------|-------------|
-| Administrator | Allowed | Allowed | Allowed | Allowed | Allowed |
-| Operator | Allowed | Denied | Allowed | Allowed | Allowed |
-
-## Directory Layout
+## Directory Layout (Updated)
 
 ```text
 project_n_one/
-├── app.py                # main Streamlit app entry point
-├── requirements.txt      # package dependencies
-├── README.md             # user documentation
-├── BRAIN.md              # system logic specification
-├── ARCHITECTURE.md       # system design documentation
-├── .gitignore            # ignore rules for temp and generated files
-├── registered_faces/     # user-registered face images
-├── unknown_faces/        # auto-registered images of unknown persons
-├── detection_logs/       # CSV audit logs
-└── unknown_person_db.csv # Database of unknown persons
-└── unknown_sighting_log.csv # Log of unknown person sightings
+├── app.py                         # Main Streamlit entry point
+├── requirements.txt               # Dependency list
+├── README.md                      # Project overview and setup guide
+├── ARCHITECTURE.md                # This design document
+├── SYNOPSIS.md                    # Project synopsis
+├── BRAIN.md                       # Core logic specification
+├── DEEPFACE_FEATURES.md           # DeepFace integration details
+├── .gitignore                     # Ignored files and folders
+├── registered_faces/              # Images of registered subjects
+├── unknown_faces/                 # Auto‑captured unknown faces
+├── detection_logs/                # CSV audit logs
+│   └── system_audit_logs.csv
+├── unknown_person_db.csv          # Database of unique unknown persons
+├── unknown_sighting_log.csv       # Sighting timestamp log
+└── temp_current_frame.jpg         # Temporary frame storage (cleared on reset)
 ```
+
+*All configuration toggles are accessible via the sidebar settings panel, enabling runtime adjustments without code changes.*
