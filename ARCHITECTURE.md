@@ -7,6 +7,7 @@
 | Streamlit UI            |
 | - RBAC login            |
 | - Registration module  |
+| - Camera face capture |
 | - Mode selector         |
 | - Camera controls       |
 | - Settings panel        |
@@ -43,7 +44,7 @@
    - **Facial Attribute Analysis** (age, gender, emotion, race)
 4. **Event Annotation** → Annotated frames returned to UI for real‑time feedback.
 5. **Persistent Logging** → All events appended to `detection_logs/system_audit_logs.csv`.
-6. **Unknown Person Handling** → Automated re‑identification and DB updates.
+6. **Unknown Person Handling** → Automated re‑identification, previous sighting lookup, current DB update, and live date/time/location feedback.
 7. **Configuration Management** → Sidebar settings control models, backends, thresholds, and feature toggles.
 
 ## Directory Layout (Updated)
@@ -63,7 +64,7 @@ project_n_one/
 ├── detection_logs/                # CSV audit logs
 │   └── system_audit_logs.csv
 ├── unknown_person_db.csv          # Database of unique unknown persons
-├── unknown_sighting_log.csv       # Sighting timestamp log
+├── unknown_sighting_log.csv       # Sighting timestamp/location log
 └── temp_current_frame.jpg         # Temporary frame storage (cleared on reset)
 ```
 

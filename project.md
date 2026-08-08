@@ -13,10 +13,11 @@ The platform integrates real-time video stream analysis with sophisticated facia
     - **Member Attendance Logger:** Tracks registered members and logs unknown individuals.
     - **Threat & Weapon Detection:** Detects hazardous objects using contour analysis and deep learning models.
 - **Role-Based Access Control (RBAC):** Secure login with `Administrator` and `Operator` roles to manage access to sensitive features like subject registration.
+- **Face-Only Registration:** Administrators can upload a profile photo or capture one through the browser camera. The system requires exactly one face, previews the detected crop, and saves only that face crop.
 - **High-Accuracy Facial Recognition:** Powered by the **DeepFace** library, supporting multiple models like `VGG-Face`, `Facenet`, `ArcFace`, and `SFace`.
 - **Advanced Face Detection:** Utilizes various backends for robust face detection, including `OpenCV`, `MTCNN`, `RetinaFace`, and `MediaPipe`.
 - **Facial Attribute Analysis:** Extracts demographic and emotional information, including **age, gender, emotion, and race**.
-- **Persistent Unknown Person Tracking:** Automatically registers, logs, and re-identifies unknown individuals, maintaining a database of all sightings.
+- **Persistent Unknown Person Tracking:** Automatically registers, logs, and re-identifies unknown individuals, maintaining a database of all sightings and showing the previous sighting date/time/location on re-identification.
 - **Dynamic Video Ingestion:** Supports a wide range of video sources, including local webcams, pre-recorded video files, and RTSP/TCP streams from IP cameras.
 - **Structured Audit & Logging:** All significant events are logged to CSV files with timestamps, available for download and analysis through the UI.
 - **Intuitive User Interface:** A modern, dark-themed dashboard built with Streamlit provides real-time video feeds, system controls, and data visualization.
@@ -25,7 +26,7 @@ The platform integrates real-time video stream analysis with sophisticated facia
 
 N-ONE uses a modular, three-layered architecture:
 
-1.  **Streamlit UI Layer:** Handles user interaction, including authentication (RBAC), mode selection, camera controls, and subject registration.
+1.  **Streamlit UI Layer:** Handles user interaction, including RBAC authentication, camera controls, face-only profile registration, mode selection, and live match-result feedback.
 2.  **Processing Layer:** The core of the system, responsible for:
     - Capturing frames via **OpenCV**.
     - Performing facial recognition and matching using **DeepFace**.
@@ -42,7 +43,8 @@ N-ONE uses a modular, three-layered architecture:
 1.  A user authenticates and selects a video source and surveillance mode via the Streamlit UI.
 2.  The Processing Layer captures video frames using OpenCV.
 3.  Based on the active mode, the frame is processed for facial recognition or threat detection.
-4.  Results are annotated on the live video feed. In "Member Attendance" mode, new faces are logged to the unknown persons' database.
+4.  Results are annotated on the live video feed. The UI distinguishes registered matches, previous-unknown matches, newly saved unknowns, and no-face events.
+5.  In "Member Attendance" mode, a previous-unknown match reads the last timestamp/location from `unknown_sighting_log.csv`, displays it, and then records the current sighting.
 5.  All events are appended to the appropriate CSV log file and displayed in the UI.
 
 ## 4. Technology Stack
@@ -80,7 +82,7 @@ project_n_one/
 
 2.  **Run the Application:**
     ```bash
-    streamlit run app.py
+    .\.venv\Scripts\python.exe -m streamlit run app.py
     ```
 3.  **Access the UI:** Open the URL provided by Streamlit in your web browser.
 

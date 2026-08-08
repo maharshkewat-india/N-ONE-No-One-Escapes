@@ -86,10 +86,11 @@ The first command is the safest option because it directly uses the project's in
 *   **High-Accuracy Facial Recognition:** Utilizes DeepFace with robust backends (Facenet/ArcFace) to ensure high precision in identifying individuals, minimizing false positives and negatives.
 *   **Dynamic Video Ingestion:** Supports diverse video sources including laptop webcams, pre-recorded files, and IP camera RTSP/TCP streams, offering deployment flexibility.
 *   **Intuitive User Interface:** A modern dark UI dashboard built with Streamlit provides an accessible and efficient operational experience for authenticated users.
-*   **Least-Privilege User Access:** A single User role can run analysis and view results without profile-management or destructive controls.
+*   **Role-Based Access Control:** Administrators can register profiles and manage settings; Operators can run analysis and view results without destructive controls.
+*   **Face-Only Profile Capture:** Administrator registration supports browser camera capture or upload, validates exactly one face, previews the crop, and saves only the face region.
 *   **Comprehensive Audit & Logging:** Real-time CSV logging and downloadable interactive data tables facilitate thorough post-event analysis, compliance, and operational transparency.
 *   **Proactive Threat Detection:** Incorporates heuristic/contour analysis and deep learning models for early detection of hazardous objects and weapons, significantly improving security posture.
-*   **Persistent Unknown Person Tracking:** Automatically registers, logs, and re-identifies unknown individuals in attendance mode, building a database of all persons sighted.
+*   **Persistent Unknown Person Tracking:** Automatically registers, logs, and re-identifies unknown individuals in attendance mode, including the previous sighting date/time/location in the live result.
 
 ### Limitations:
 *   **Environmental Dependencies:** Performance of computer vision models can be affected by lighting conditions, occlusions, camera angle, and image quality.
@@ -132,7 +133,7 @@ Weapon detection research has similarly benefited from deep learning, moving bey
 | **Threat Detection**         | Simple motion detection, basic contour analysis, human-dependent | **Advanced AI:** Heuristic/contour + deep model detection of weapons               |
 | **Video Ingestion**          | Limited to specific camera types, often proprietary formats | **Dynamic & Versatile:** Laptop Webcam, Recorded Files, RTSP/TCP IP Cameras         |
 | **User Interface**           | Often clunky, desktop-only, or dated web interfaces        | **Modern Streamlit UI:** Intuitive, dark-themed, web-based dashboard              |
-| **Access Control**           | Basic user accounts, often lacking granular permissions    | **Least-Privilege User Role:** Analysis and read-only monitoring access               |
+| **Access Control**           | Basic user accounts, often lacking granular permissions    | **RBAC:** Administrator profile/settings access and Operator analysis/read-only access |
 | **Audit & Logging**          | Manual review of footage, simple event logs, non-structured | **Structured Audit & Logging Engine:** Real-time CSV, interactive data tables     |
 | **Scalability (initial)**    | Limited by hardware and software integration complexity    | Designed for modularity; extensible for diverse environments (requires resources) |
 | **Deployment Complexity**    | Often vendor-locked, complex setup and configuration       | Python-based, leverages open-source libraries, simpler deployment for developers |
@@ -170,7 +171,7 @@ graph TD
 
     H --> I[Streamlit Dashboard (Modern Dark UI)]
     J[User Authentication] --> I
-    J --> K[Pre-registered Profiles (Offline)]
+    J --> K[Administrator Profile Registration]
     K --> G1
 
     I -- User Interaction --> D
@@ -179,13 +180,13 @@ graph TD
 
 ### Module Workflow Breakdown:
 
-1.  **User Authentication Gate:**
-    *   **Function:** Authenticates one least-privilege User account from environment variables or Streamlit Secrets.
-    *   **Workflow:** User attempts to access the system -> the authentication gate verifies credentials -> the User receives analysis, monitoring, and read-only log access.
+1.  **Administrator/Operator Authentication Gate:**
+    *   **Function:** Authenticates separate Administrator and Operator accounts using `ADMIN_*` and `OPERATOR_*` values from environment variables or Streamlit Secrets.
+    *   **Workflow:** A user attempts to access the system -> RBAC verifies the credentials -> Administrators receive profile/settings controls, while Operators receive monitoring, analysis, and read-only log access.
 
-2.  **Pre-registered Profile Preparation (Offline):**
-    *   **Function:** Profile preparation is kept outside the User-facing application.
-    *   **Workflow:** Deployment owners prepare approved profile data before testing; User accounts cannot create, modify, or delete profiles.
+2.  **Administrator Profile Registration:**
+    *   **Function:** Administrators can register an approved lost person or member using an uploaded image or a browser camera capture.
+    *   **Workflow:** The registration screen requires exactly one detectable face, shows a face-only crop preview, and saves only that crop. User/Operator accounts cannot create, modify, or delete profiles.
 
 3.  **Dynamic Video Feed Ingestion:**
     *   **Function:** Decodes and processes video streams from multiple sources.
@@ -207,8 +208,8 @@ graph TD
     *   **Function:** Automatically logs, tracks, and re-identifies individuals not present in the registered member database.
     *   **Workflow:**
         *   An unknown face is detected. The system compares it against the `unknown_faces` database.
-        *   **Re-identification:** If a match is found, the system retrieves the person's unique ID, updates their `last_seen_timestamp`, and logs the sighting. The UI displays the ID and first-seen date.
-        *   **New Registration:** If no match is found, the system saves the face, assigns a new unique ID (e.g., `unknown_001`), and creates a new entry in the `unknown_person_db.csv` and `unknown_sighting_log.csv`.
+        *   **Re-identification:** If a match is found, the system retrieves the person's unique ID and previous image, reads the last sighting from `unknown_sighting_log.csv`, then updates `last_seen_timestamp` and location. The UI displays the previous sighting date/time/location and the current match date/time/location.
+        *   **New Registration:** If no match is found, the system saves the face crop, assigns a new unique ID (e.g., `unknown_001`), and creates a new entry in `unknown_person_db.csv` and `unknown_sighting_log.csv`. The UI reports that the face was saved as a new unknown.
 
 8.  **Mode 3: Threat & Weapon Pattern Detection Mode:**
     *   **Function:** Detects hazardous objects or weapons in the video stream.
@@ -220,7 +221,7 @@ graph TD
 
 10. **Streamlit Dashboard (Modern Dark UI):**
     *   **Function:** Provides the central interactive interface for system control, monitoring, and data visualization.
-    *   **Workflow:** Receives processed data and alerts from various modules -> Renders real-time video feeds with overlays, alerts, and statistical summaries -> Allows User interaction for mode selection, analysis, and read-only log retrieval.
+    *   **Workflow:** Receives processed data and alerts from various modules -> Renders real-time video feeds with overlays, match status, saved/matched face previews, alerts, and summary metrics -> Applies the appropriate Administrator or Operator controls.
 
 ## 7. FEASIBILITY STUDY
 

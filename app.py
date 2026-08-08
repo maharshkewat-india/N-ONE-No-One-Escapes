@@ -1,6 +1,7 @@
 import hmac
 import os
 import time
+from io import BytesIO
 from pathlib import Path
 
 import cv2
@@ -220,6 +221,9 @@ def record_detection_result(
     distance: float | None = None,
     details: str = "",
     image_name: str = "",
+    location: str = "",
+    previous_timestamp: str = "",
+    previous_location: str = "",
 ) -> None:
     """Store the latest recognition event for the live status panel."""
     st.session_state.last_detection = {
@@ -228,7 +232,10 @@ def record_detection_result(
         "distance": distance,
         "details": details,
         "image_name": image_name,
-        "timestamp": time.strftime("%H:%M:%S"),
+        "location": location,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "previous_timestamp": previous_timestamp,
+        "previous_location": previous_location,
     }
 
 
@@ -268,6 +275,35 @@ def log_sighting(unknown_id: str, timestamp: str, location: str) -> None:
         [[sighting_id, unknown_id, timestamp, location]], columns=["sighting_id", "unknown_id", "timestamp", "location"]
     )
     new_sighting_df.to_csv(UNKNOWN_SIGHTING_LOG_PATH, mode="a", header=False, index=False)
+
+
+def get_last_unknown_sighting(unknown_id: str) -> dict[str, str]:
+    """Read the last saved date/time and location before a new re-identification."""
+    try:
+        sighting_df = pd.read_csv(UNKNOWN_SIGHTING_LOG_PATH)
+        matches = sighting_df[sighting_df["unknown_id"].astype(str) == unknown_id]
+        if not matches.empty:
+            last = matches.sort_values("timestamp").iloc[-1]
+            return {
+                "timestamp": str(last.get("timestamp", "")),
+                "location": str(last.get("location", "")),
+            }
+    except (FileNotFoundError, pd.errors.EmptyDataError, KeyError, IndexError):
+        pass
+
+    try:
+        unknown_df = pd.read_csv(UNKNOWN_DB_PATH)
+        matches = unknown_df[unknown_df["unknown_id"].astype(str) == unknown_id]
+        if not matches.empty:
+            last = matches.iloc[-1]
+            return {
+                "timestamp": str(last.get("last_seen_timestamp", "")),
+                "location": str(last.get("last_known_location", "")),
+            }
+    except (FileNotFoundError, pd.errors.EmptyDataError, KeyError, IndexError):
+        pass
+
+    return {"timestamp": "", "location": ""}
 
 
 def update_unknown_sighting(unknown_id: str, location: str, mode: str) -> None:
@@ -471,6 +507,7 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
                 match_path = Path(best_unknown["identity"])
                 unknown_id = match_path.stem
                 distance = float(best_unknown.get("distance", 0.0))
+                previous_sighting = get_last_unknown_sighting(unknown_id)
                 update_unknown_sighting(unknown_id, "Main Feed", mode)
                 detection_summary = f"Re-identified previous unknown: {unknown_id} (distance {distance:.3f})"
                 record_detection_result(
@@ -479,6 +516,9 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
                     distance=distance,
                     details="Matched against a previously saved unknown face.",
                     image_name=match_path.name,
+                    location="Main Feed",
+                    previous_timestamp=previous_sighting.get("timestamp", ""),
+                    previous_location=previous_sighting.get("location", ""),
                 )
                 color = (255, 165, 0) # Orange
                 cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
@@ -496,6 +536,7 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
             subject=unknown_id,
             details="No known or previous-unknown match; face image was saved.",
             image_name=f"{unknown_id}.jpg",
+            location="Main Feed",
         )
         color = (255, 255, 0) # Cyan
         cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
@@ -519,11 +560,20 @@ def render_detection_result(container) -> None:
     distance_text = f" | distance: {distance:.3f}" if distance is not None else ""
     timestamp = result.get("timestamp", "")
     details = result.get("details", "")
+    previous_timestamp = result.get("previous_timestamp", "")
+    previous_location = result.get("previous_location", "")
+    current_location = result.get("location", "")
 
     if result_type == "known_match":
         panel.success(f"MATCH FOUND: {subject}{distance_text}")
     elif result_type == "unknown_match":
         panel.warning(f"PREVIOUS UNKNOWN MATCH: {subject}{distance_text}")
+        if previous_timestamp or previous_location:
+            panel.markdown(
+                "**Previous sighting:** "
+                f"{previous_timestamp or 'date/time unavailable'} at "
+                f"{previous_location or 'location unavailable'}"
+            )
     elif result_type == "new_unknown":
         panel.warning(f"NO MATCH - SAVED AS NEW UNKNOWN: {subject}")
     elif result_type == "no_face":
@@ -543,7 +593,9 @@ def render_detection_result(container) -> None:
         if image_path.exists():
             panel.image(str(image_path), caption="Previous/saved unknown face", width="content")
     if timestamp:
-        panel.caption(f"Last event: {timestamp}")
+        event_label = "Current match" if result_type == "unknown_match" else "Last event"
+        current_context = f" at {current_location}" if current_location else ""
+        panel.caption(f"{event_label}: {timestamp}{current_context}")
 
 
 def configure_session_state() -> None:
@@ -557,6 +609,9 @@ def configure_session_state() -> None:
             "details": "No detections yet.",
             "image_name": "",
             "timestamp": "",
+            "location": "",
+            "previous_timestamp": "",
+            "previous_location": "",
         },
         "last_logged_event": "",
         "active_alerts": [],
@@ -572,25 +627,97 @@ def configure_session_state() -> None:
         st.session_state.setdefault(key, value)
 
 
-def save_registered_profile(name: str, role_label: str, uploaded_file) -> bool:
-    """Save a face profile. This operation is available to Administrators only."""
-    if not name or not uploaded_file:
-        return False
+def detect_face_regions(image: np.ndarray) -> list[dict]:
+    """Return face bounding boxes from either the real or fallback backend."""
+    if hasattr(DeepFace, "detect_faces"):
+        try:
+            return [
+                item["facial_area"]
+                for item in DeepFace.detect_faces(image)
+                if item.get("facial_area")
+            ]
+        except Exception:
+            pass
+
+    try:
+        extracted = DeepFace.extract_faces(
+            img_path=image,
+            detector_backend="opencv",
+            enforce_detection=True,
+            align=True,
+        )
+        return [
+            item["facial_area"]
+            for item in extracted
+            if item.get("facial_area")
+        ]
+    except Exception:
+        return []
+
+
+def prepare_single_face_crop(uploaded_file) -> tuple[np.ndarray | None, str]:
+    """Validate a registration photo and return a face-only BGR crop."""
+    if uploaded_file is None:
+        return None, "Choose an image or capture a photo first."
+
+    try:
+        image = Image.open(BytesIO(uploaded_file.getvalue())).convert("RGB")
+        frame = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+    except Exception as exc:
+        return None, f"Could not read the image: {exc}"
+
+    regions = detect_face_regions(frame)
+    if len(regions) == 0:
+        return None, "No face detected. Face the camera directly with good lighting."
+    if len(regions) > 1:
+        return None, "Multiple faces detected. Keep only one person in the frame."
+
+    region = regions[0]
+    x, y, width, height = (
+        int(region["x"]),
+        int(region["y"]),
+        int(region["w"]),
+        int(region["h"]),
+    )
+    if width < 80 or height < 80:
+        return None, "Face is too small. Move closer to the camera."
+
+    padding = int(max(width, height) * 0.25)
+    left = max(0, x - padding)
+    top = max(0, y - padding)
+    right = min(frame.shape[1], x + width + padding)
+    bottom = min(frame.shape[0], y + height + padding)
+    crop = frame[top:bottom, left:right]
+    if crop.size == 0:
+        return None, "Face crop was empty. Please capture the image again."
+
+    return crop, "One face detected. Only the face crop will be saved."
+
+
+def save_registered_profile(
+    name: str, role_label: str, uploaded_file
+) -> tuple[bool, str]:
+    """Save a face-only profile. This operation is Administrator-only."""
+    if not name:
+        return False, "Provide a name or identifier."
+
+    crop, message = prepare_single_face_crop(uploaded_file)
+    if crop is None:
+        return False, message
 
     prefix = "Lost" if "Lost" in role_label else "Member"
     safe_name = "".join(
         character if character.isalnum() else "_" for character in name
     ).strip("_")
     if not safe_name:
-        return False
+        return False, "Provide a valid name or identifier."
 
     destination = REG_DIR / f"{prefix}_{safe_name}.jpg"
-    with Image.open(uploaded_file) as image:
-        image.convert("RGB").save(destination)
+    cv2.imwrite(str(destination), crop)
 
     load_known_face_encodings.clear()
     load_known_face_encodings()
-    return True
+    return True, message
 
 
 def clear_audit_log() -> None:
@@ -672,22 +799,53 @@ def render_sidebar() -> None:
     if st.session_state.role == "Administrator":
         st.sidebar.markdown("---")
         st.sidebar.header("Administrator controls")
+        photo_source = st.sidebar.radio(
+            "Profile photo source",
+            ["Upload image", "Camera capture"],
+            horizontal=True,
+            key="registration_photo_source",
+        )
+        if photo_source == "Camera capture":
+            uploaded_photo = st.sidebar.camera_input(
+                "Capture one face",
+                key="registration_camera",
+                help="Keep one person centered, facing the camera, with good lighting.",
+                resolution="720p",
+            )
+        else:
+            uploaded_photo = st.sidebar.file_uploader(
+                "Upload face image", type=["jpg", "jpeg", "png"], key="registration_upload"
+            )
+
+        prepared_crop = None
+        if uploaded_photo is not None:
+            prepared_crop, crop_message = prepare_single_face_crop(uploaded_photo)
+            if prepared_crop is not None:
+                st.sidebar.success(crop_message)
+                st.sidebar.image(
+                    cv2.cvtColor(prepared_crop, cv2.COLOR_BGR2RGB),
+                    caption="Face-only profile preview",
+                    width="content",
+                )
+            else:
+                st.sidebar.warning(crop_message)
+
         with st.sidebar.form("registration_form"):
             reg_name = st.text_input("Full Name / Identifier")
             reg_role = st.selectbox(
                 "Classification Role",
                 ["Lost Person / Victim", "Registered Member / Staff"],
             )
-            uploaded_photo = st.file_uploader(
-                "Upload Clear Face Photo", type=["jpg", "jpeg", "png"]
-            )
             submitted = st.form_submit_button("Save Profile")
             if submitted:
-                if save_registered_profile(reg_name, reg_role, uploaded_photo):
+                saved, save_message = save_registered_profile(
+                    reg_name, reg_role, uploaded_photo
+                )
+                if saved:
                     st.sidebar.success(f"Registered profile for {reg_name}")
                     st.session_state.last_status = "Profile saved"
                 else:
-                    st.sidebar.error("Provide both name and photo.")
+                    st.sidebar.error(save_message)
 
         st.sidebar.markdown("---")
         st.sidebar.header("AI Model Configuration")
