@@ -257,8 +257,10 @@ pytest tests/test_deepface_adapter.py --cov=deepface_adapter --cov-report=term-m
 
 ```bash
 # Required authentication secrets (configure outside the repository)
-USER_USERNAME=YOUR_USER_USERNAME_HERE
-USER_PASSWORD=YOUR_USER_PASSWORD_HERE
+ADMIN_USERNAME=YOUR_ADMIN_USERNAME_HERE
+ADMIN_PASSWORD=YOUR_ADMIN_PASSWORD_HERE
+OPERATOR_USERNAME=YOUR_OPERATOR_USERNAME_HERE
+OPERATOR_PASSWORD=YOUR_OPERATOR_PASSWORD_HERE
 ```
 
 ### 5.2 Validation Checks
@@ -479,8 +481,10 @@ from deepface_adapter import (
 pip install -r requirements.txt
 
 # 2. Set environment variables
-export USER_USERNAME=YOUR_USER_USERNAME_HERE
-export USER_PASSWORD=YOUR_USER_PASSWORD_HERE
+export ADMIN_USERNAME=YOUR_ADMIN_USERNAME_HERE
+export ADMIN_PASSWORD=YOUR_ADMIN_PASSWORD_HERE
+export OPERATOR_USERNAME=YOUR_OPERATOR_USERNAME_HERE
+export OPERATOR_PASSWORD=YOUR_OPERATOR_PASSWORD_HERE
 
 # 3. Run the application
 python app.py
@@ -503,4 +507,22 @@ pytest tests/ -v
 
 ---
 
-*Last updated: 2026-08-08 | Version: 1.0.0*
+*Last updated: 2026-08-09 | Version: 1.1.0*
+
+## 14. Current target-search behavior (2026-08-09)
+
+Model configuration is shared by normal recognition and Victim search, but the candidate set changes in `1. Lost Person Search`:
+
+1. The operator selects one profile whose normalized category is `Victim`.
+2. The selected model creates an embedding for each detected face.
+3. The known-face cache is filtered by the selected Victim profile ID before distance comparison.
+4. Only a match within the configured threshold is drawn and reported as `Victim Found`.
+5. All non-matching faces still go through unknown re-identification/registration, but no unknown ID is rendered in Victim-search mode.
+
+The current camera location is passed to both unknown sighting updates and Victim sighting records. Victim history is stored at `detection_logs/victim_sighting_log.csv` and is displayed in the result panel and log viewer.
+
+The application test command is:
+
+```powershell
+python -m pytest tests -q
+```

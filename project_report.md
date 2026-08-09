@@ -1,6 +1,6 @@
 # PROJECT N-ONE: Status and Test Report
 
-**Date:** 2026-08-05
+**Date:** 2026-08-09
 
 ---
 
@@ -22,13 +22,26 @@ The following major features were recently implemented and integrated into the a
     - **Re-identification:** On subsequent sightings, the system recognizes the individual, updates their "last seen" timestamp, and logs the new sighting.
     - **Real-time Feedback:** The video feed is annotated with the person's unique ID and the timestamp of their first appearance, providing immediate context to the operator.
 
-### b. "Unknown Persons Gallery" UI
+### b. Unknown-person database and log viewer
 
-- **Description:** A new expandable gallery section has been added to the main dashboard.
+- **Description:** The dashboard exposes the persistent unknown-person database and sighting records in interactive tables.
 - **Functionality:**
-    - Provides a visual grid of all unique unknown individuals logged by the system.
-    - Each entry displays the person's face, their assigned unique ID, and the timestamp of their first sighting.
-    - This allows operators to quickly get a visual overview of all non-registered individuals who have been in the monitored area.
+    - Shows unique unknown IDs, image paths, first/last sighting timestamps, and last-known locations.
+    - Unknown faces are saved in `unknown_faces/` and re-identified through the CSV database.
+    - During Victim Search, this workflow continues in the background without showing unknown IDs on the live result panel.
+
+### c. Registered-face inventory and categories
+
+- Both Administrator and Operator dashboards show registered-face and unknown-face totals.
+- Registered profiles are normalized to `Staff` and `Victim`; legacy `Member_` and `Lost_` profile names remain compatible.
+- The dashboard provides `All`, `Staff`, and `Victim` inventory filters.
+
+### d. Victim-only search and location history
+
+- Lost Person Search now requires one selected Victim target.
+- Only that target can appear as a visible match. Unknown faces continue to be registered/re-identified silently.
+- Camera location is captured from the operator and persisted with Victim sightings.
+- `detection_logs/victim_sighting_log.csv` stores throttled sightings and the dashboard displays the latest sighting per location.
 
 ---
 
@@ -47,13 +60,13 @@ All primary documentation files have been **successfully updated** to reflect th
 
 ---
 
-## 4. Static Test & Dependency Analysis
+## 4. Test & Dependency Analysis
 
-As I cannot perform live execution, a static analysis was conducted.
+The application test suite and syntax checks were run locally; the vendored DeepFace tests are not part of the application test command.
 
 ### a. Code Quality & Structure
 
-- The Python code in `app.py` is well-structured, with functionality broken down into distinct functions (e.g., `handle_unknown_person`, `render_unknown_gallery`).
+- The Python code in `app.py` is organized into authentication, registration, inventory, recognition, unknown tracking, Victim sighting, and rendering helpers.
 - State is managed effectively through Streamlit's `st.session_state`.
 - Error handling is present, particularly the `try...except` block for the optional `deepface` dependency, which allows the application to run in a degraded mode.
 - A minor f-string syntax error was identified and corrected during development.
@@ -65,7 +78,14 @@ As I cannot perform live execution, a static analysis was conducted.
 
 ---
 
-## 5. Suggested Next Steps
+## 5. Validation Results
+
+- `python -m pytest tests -q`: 5 tests passed.
+- `python -m py_compile app.py deepface_adapter.py`: passed.
+- `git diff --check`: passed.
+- The full repository pytest command also discovers the vendored `deepface/tests` tree, which has optional dependencies not required by the N-ONE app. Use `python -m pytest tests -q` for the application test suite.
+
+## 6. Suggested Next Steps
 
 The project is in a strong state. To further enhance the dashboard's operational value, the following improvements could be prioritized next:
 

@@ -40,3 +40,21 @@ This section guides you through submitting an enhancement suggestion for N-ONE, 
 3.  Ensure your pull request has a clear title and description of the changes.
 
 Thank you for your contribution!
+
+## Current feature and documentation expectations
+
+When changing recognition or dashboard behavior, update the relevant root-level documentation as well as `app.py`. In particular, keep these rules synchronized:
+
+- Registered profiles use `Staff` and `Victim`; retain compatibility with `Member_` and `Lost_` files unless a migration is explicitly planned.
+- Both Administrator and Operator dashboards expose registered/unknown counts and the registered-face inventory filters.
+- Victim Search must remain target-specific: only the selected Victim can be displayed as a visible match.
+- Unknown faces must continue to be stored/re-identified silently during Victim Search.
+- Camera location belongs in unknown sightings and Victim sighting history.
+- Document user-visible Streamlit connection caveats such as Windows `WinError 10054` when the browser closes during the live loop.
+
+Before opening a pull request, run:
+
+```powershell
+python -m pytest tests -q
+python -m py_compile app.py deepface_adapter.py
+```

@@ -174,13 +174,13 @@ Sidebar → "🔧 DeepFace Settings" (expandable)
 ## Surveillance Modes
 
 ### 1. **Lost Person Search**
-- Focuses on facial recognition accuracy
-- Uses best model for identity verification
-- Logs all matches with confidence scores
-- Ideal for finding missing persons
+- Requires one selected Victim profile
+- Restricts known-face matching to that Victim only
+- Shows the Victim name/location when found
+- Silently stores or re-identifies all other faces as unknown
 
 ### 2. **Member Attendance Logger**
-- Tracks registered staff/members
+- Tracks registered Staff profiles
 - Records attendance with timestamps
 - Maintains audit logs
 - Fast recognition preferred
@@ -302,7 +302,7 @@ Located below main surveillance feed after authentication
 
 ### Registered Profiles
 - Stored in `/registered_faces/` directory
-- Organized by role (Member/Lost Person)
+- Organized by category (`Staff`/`Victim`); legacy `Member_`/`Lost_` prefixes remain supported
 - Audit logged for access
 
 ### Unknown Persons
@@ -383,6 +383,29 @@ For more information:
 
 ---
 
-**Last Updated**: 2026-08-06  
+**Last Updated**: 2026-08-09
 **Platform Version**: N-ONE v1.1  
 **DeepFace Version**: 0.0.100
+
+## Current N-ONE workflow update (2026-08-09)
+
+### Registered profile categories
+
+The application stores face-only crops in `registered_faces/` and classifies them as `Staff` or `Victim`. The filename parser remains backward compatible with legacy `Member_` (Staff) and `Lost_` (Victim) prefixes.
+
+### Victim-only search
+
+In `1. Lost Person Search`, an operator selects one Victim profile. The DeepFace/OpenCV embedding comparison is restricted to that profile. A Staff profile, another Victim, or an unknown person cannot appear as the visible Victim result.
+
+Unknown faces are still sent through the existing unknown database workflow. New faces are saved to `unknown_faces/`; repeated faces update `unknown_person_db.csv` and `unknown_sighting_log.csv`. In Victim search these unknown events are intentionally silent in the rendered video/result panel.
+
+### Victim sighting history
+
+The operator supplies a camera location. When the selected Victim matches, the app records the profile ID, name, timestamp, and location in `detection_logs/victim_sighting_log.csv`. Duplicate frames at the same camera are throttled for 60 seconds, and the UI shows the latest sighting for each distinct location.
+
+### Current verification
+
+```powershell
+python -m pytest tests -q
+python -m py_compile app.py deepface_adapter.py
+```

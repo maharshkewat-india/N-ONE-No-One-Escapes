@@ -91,6 +91,7 @@ CSV_LOG_PATH = LOG_DIR / "system_audit_logs.csv"
 TEMP_VIDEO_PATH = ROOT_DIR / "temp_video_upload.mp4"
 UNKNOWN_DB_PATH = ROOT_DIR / "unknown_person_db.csv"
 UNKNOWN_SIGHTING_LOG_PATH = ROOT_DIR / "unknown_sighting_log.csv"
+VICTIM_SIGHTING_LOG_PATH = LOG_DIR / "victim_sighting_log.csv"
 
 # DeepFace Model Configuration
 DEEPFACE_MODELS = ["VGG-Face", "Facenet", "Facenet512", "OpenFace", "DeepFace", "ArcFace", "SFace"]
@@ -103,6 +104,7 @@ DEEPFACE_MODEL = "Facenet"
 DEEPFACE_BACKEND = "opencv"
 DEEPFACE_METRIC = "cosine"
 COSINE_THRESHOLD = 0.40
+PROFILE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 # --- In-memory Cache ---
 KNOWN_FACE_ENCODINGS = []
@@ -128,6 +130,10 @@ def initialize_log_files() -> None:
     if not UNKNOWN_SIGHTING_LOG_PATH.exists() or UNKNOWN_SIGHTING_LOG_PATH.stat().st_size == 0:
         pd.DataFrame(columns=["sighting_id", "unknown_id", "timestamp", "location"]).to_csv(
             UNKNOWN_SIGHTING_LOG_PATH, index=False
+        )
+    if not VICTIM_SIGHTING_LOG_PATH.exists() or VICTIM_SIGHTING_LOG_PATH.stat().st_size == 0:
+        pd.DataFrame(columns=["profile_id", "name", "timestamp", "location"]).to_csv(
+            VICTIM_SIGHTING_LOG_PATH, index=False
         )
 
 
@@ -156,17 +162,119 @@ def get_next_unknown_id() -> str:
     return f"unknown_{last_num + 1:03d}"
 
 
+def get_profile_category(profile_stem: str) -> str:
+    """Normalize current and legacy profile prefixes to the dashboard labels."""
+    prefix = profile_stem.split("_", 1)[0].lower()
+    return "Victim" if prefix in {"victim", "lost"} else "Staff"
+
+
+def get_profile_name(profile_stem: str) -> str:
+    """Return a readable profile name from a stored filename."""
+    _, separator, name = profile_stem.partition("_")
+    return (name if separator else profile_stem).replace("_", " ")
+
+
+def get_registered_profiles_df() -> pd.DataFrame:
+    """Build the registered-face inventory used by both authenticated roles."""
+    profiles = []
+    for image_path in REG_DIR.iterdir() if REG_DIR.exists() else []:
+        if not image_path.is_file() or image_path.suffix.lower() not in PROFILE_IMAGE_SUFFIXES:
+            continue
+        profiles.append(
+            {
+                "profile_id": image_path.stem,
+                "name": get_profile_name(image_path.stem),
+                "category": get_profile_category(image_path.stem),
+                "file_name": image_path.name,
+            }
+        )
+
+    return pd.DataFrame(
+        profiles,
+        columns=["profile_id", "name", "category", "file_name"],
+    ).sort_values(["category", "name"], ignore_index=True)
+
+
 def get_registered_profile_count() -> int:
     """Return the number of saved profiles visible to the dashboard."""
-    if KNOWN_FACE_ENCODINGS:
-        return len(KNOWN_FACE_ENCODINGS)
+    return len(get_registered_profiles_df())
 
-    profile_files = [
-        img_path
-        for img_path in REG_DIR.glob("*.*")
-        if img_path.suffix.lower() in {".jpg", ".jpeg", ".png"}
-    ]
-    return len(profile_files)
+
+def get_unknown_face_count() -> int:
+    """Return the number of unique unknown faces currently tracked."""
+    try:
+        unknown_df = pd.read_csv(UNKNOWN_DB_PATH)
+        if "unknown_id" in unknown_df.columns:
+            unknown_count = int(unknown_df["unknown_id"].dropna().astype(str).nunique())
+            if unknown_count:
+                return unknown_count
+    except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        pass
+
+    if not UNKNOWN_DIR.exists():
+        return 0
+    return sum(
+        1
+        for image_path in UNKNOWN_DIR.iterdir()
+        if image_path.is_file() and image_path.suffix.lower() in PROFILE_IMAGE_SUFFIXES
+    )
+
+
+def is_victim_search_mode(mode: str) -> bool:
+    """Return whether the selected mode searches for one victim target only."""
+    return mode.startswith("1.")
+
+
+def record_victim_sighting(profile_id: str, name: str, location: str) -> bool:
+    """Persist a victim sighting, throttling duplicate frames at one camera."""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        sighting_df = pd.read_csv(VICTIM_SIGHTING_LOG_PATH)
+    except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        sighting_df = pd.DataFrame(
+            columns=["profile_id", "name", "timestamp", "location"]
+        )
+
+    matches = sighting_df[sighting_df["profile_id"].astype(str) == str(profile_id)]
+    if not matches.empty:
+        last = matches.sort_values("timestamp").iloc[-1]
+        last_timestamp = pd.to_datetime(last.get("timestamp"), errors="coerce")
+        current_timestamp = pd.to_datetime(timestamp)
+        if (
+            str(last.get("location", "")) == location
+            and not pd.isna(last_timestamp)
+            and (current_timestamp - last_timestamp).total_seconds() < 60
+        ):
+            return False
+
+    write_header = not VICTIM_SIGHTING_LOG_PATH.exists() or VICTIM_SIGHTING_LOG_PATH.stat().st_size == 0
+    pd.DataFrame(
+        [[profile_id, name, timestamp, location]],
+        columns=["profile_id", "name", "timestamp", "location"],
+    ).to_csv(VICTIM_SIGHTING_LOG_PATH, mode="a", header=write_header, index=False)
+    return True
+
+
+def get_victim_sighting_history(profile_id: str = "") -> pd.DataFrame:
+    """Return the latest sighting for each location for a victim profile."""
+    columns = ["profile_id", "name", "timestamp", "location"]
+    try:
+        sighting_df = pd.read_csv(VICTIM_SIGHTING_LOG_PATH)
+    except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        return pd.DataFrame(columns=columns)
+
+    if profile_id:
+        sighting_df = sighting_df[
+            sighting_df["profile_id"].astype(str) == str(profile_id)
+        ]
+    if sighting_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    return (
+        sighting_df.sort_values("timestamp", ascending=False)
+        .drop_duplicates("location", keep="first")
+        .reset_index(drop=True)
+    )
 
 
 @st.cache_resource
@@ -180,8 +288,8 @@ def load_known_face_encodings():
         if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
             continue
 
-        name = img_path.stem.split("_", 1)[-1]
-        role = "Lost" if img_path.stem.startswith("Lost") else "Member"
+        name = get_profile_name(img_path.stem)
+        role = get_profile_category(img_path.stem)
         embedding = None
         try:
             embedding_obj = DeepFace.represent(
@@ -192,16 +300,30 @@ def load_known_face_encodings():
         except Exception as e:
             st.warning(f"Could not process {img_path.name}: {e}")
 
-        KNOWN_FACE_ENCODINGS.append({"name": name, "role": role, "encoding": embedding})
+        KNOWN_FACE_ENCODINGS.append(
+            {
+                "profile_id": img_path.stem,
+                "name": name,
+                "role": role,
+                "encoding": embedding,
+            }
+        )
 
 
 def find_face_in_known_cache(
-    face_encoding: list, threshold: float = COSINE_THRESHOLD
+    face_encoding: list,
+    threshold: float = COSINE_THRESHOLD,
+    profile_id: str | None = None,
+    role: str | None = None,
 ) -> dict | None:
     """Return the closest known profile when it is inside the match threshold."""
     best_match = None
     best_distance = float("inf")
     for entry in KNOWN_FACE_ENCODINGS:
+        if profile_id and entry.get("profile_id") != profile_id:
+            continue
+        if role and entry.get("role") != role:
+            continue
         if entry.get("encoding") is None:
             continue
         distance = cosine(np.array(face_encoding), np.array(entry["encoding"]))
@@ -224,6 +346,7 @@ def record_detection_result(
     location: str = "",
     previous_timestamp: str = "",
     previous_location: str = "",
+    profile_id: str = "",
 ) -> None:
     """Store the latest recognition event for the live status panel."""
     st.session_state.last_detection = {
@@ -236,6 +359,7 @@ def record_detection_result(
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "previous_timestamp": previous_timestamp,
         "previous_location": previous_location,
+        "profile_id": profile_id,
     }
 
 
@@ -419,10 +543,17 @@ def check_weapon_contours(frame) -> tuple[bool, list[tuple[int, int, int, int]]]
     return threat_found, boxes
 
 
-def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
+def process_frame(
+    frame: np.ndarray,
+    mode: str,
+    target_profile_id: str | None = None,
+    location: str = "Main Feed",
+) -> tuple[np.ndarray, str]:
     """The core processing pipeline for each video frame."""
     annotated_frame = frame.copy()
     detection_summary = "Status: Idle"
+    victim_search = is_victim_search_mode(mode)
+    victim_found = None
 
     is_face_rec_mode = "Threat" not in mode
     
@@ -475,22 +606,57 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
         match_threshold = float(
             st.session_state.get("similarity_threshold", COSINE_THRESHOLD)
         )
-        known_match = find_face_in_known_cache(face_encoding, match_threshold)
+        if victim_search:
+            known_match = (
+                find_face_in_known_cache(
+                    face_encoding,
+                    match_threshold,
+                    profile_id=target_profile_id,
+                    role="Victim",
+                )
+                if target_profile_id
+                else None
+            )
+        else:
+            known_match = find_face_in_known_cache(face_encoding, match_threshold)
         if known_match:
             name, role = known_match["name"], known_match["role"]
             distance = known_match["distance"]
-            color = (0, 255, 0) if role == "Member" else (255, 0, 0)
+            color = (0, 255, 0) if role == "Staff" else (255, 0, 0)
+            if victim_search:
+                victim_found = known_match
+                color = (0, 255, 0)
+                if record_victim_sighting(
+                    known_match["profile_id"], name, location
+                ):
+                    log_event(
+                        mode=mode,
+                        subject_id=known_match["profile_id"],
+                        role="Victim",
+                        event_type="Victim Found",
+                        details=f"Camera location: {location}",
+                    )
             cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
             label = f"{role}: {name}"
             cv2.putText(annotated_frame, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
             detection_summary = f"Matched: {label} (distance {distance:.3f})"
-            record_detection_result(
-                "known_match",
-                subject=label,
-                distance=distance,
-                details="Matched against a registered profile.",
-            )
-            log_event(mode=mode, subject_id=name, role=role, event_type="Known Face Match")
+            if victim_search:
+                record_detection_result(
+                    "victim_found",
+                    subject=name,
+                    distance=distance,
+                    details="Selected victim matched against the camera feed.",
+                    location=location,
+                    profile_id=known_match["profile_id"],
+                )
+            else:
+                record_detection_result(
+                    "known_match",
+                    subject=label,
+                    distance=distance,
+                    details="Matched against a registered profile.",
+                )
+                log_event(mode=mode, subject_id=name, role=role, event_type="Known Face Match")
             continue
 
         # Step B: If not a known face, check against the UNKNOWN database on disk
@@ -508,7 +674,9 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
                 unknown_id = match_path.stem
                 distance = float(best_unknown.get("distance", 0.0))
                 previous_sighting = get_last_unknown_sighting(unknown_id)
-                update_unknown_sighting(unknown_id, "Main Feed", mode)
+                update_unknown_sighting(unknown_id, location, mode)
+                if victim_search:
+                    continue
                 detection_summary = f"Re-identified previous unknown: {unknown_id} (distance {distance:.3f})"
                 record_detection_result(
                     "unknown_match",
@@ -516,7 +684,7 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
                     distance=distance,
                     details="Matched against a previously saved unknown face.",
                     image_name=match_path.name,
-                    location="Main Feed",
+                    location=location,
                     previous_timestamp=previous_sighting.get("timestamp", ""),
                     previous_location=previous_sighting.get("location", ""),
                 )
@@ -529,18 +697,44 @@ def process_frame(frame: np.ndarray, mode: str) -> tuple[np.ndarray, str]:
              pass
         
         # Step C: If not known and not previously unknown, register as a NEW UNKNOWN
-        unknown_id = register_new_unknown(face_roi, "Main Feed", mode)
+        unknown_id = register_new_unknown(face_roi, location, mode)
+        if victim_search:
+            continue
         detection_summary = f"No registered match - saved as new unknown: {unknown_id}"
         record_detection_result(
             "new_unknown",
             subject=unknown_id,
             details="No known or previous-unknown match; face image was saved.",
             image_name=f"{unknown_id}.jpg",
-            location="Main Feed",
+            location=location,
         )
         color = (255, 255, 0) # Cyan
         cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
         cv2.putText(annotated_frame, f"New ID: {unknown_id}", (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+
+    if victim_search:
+        if victim_found:
+            detection_summary = (
+                f"Victim found: {victim_found['name']} at {location}"
+            )
+        else:
+            target_name = next(
+                (
+                    entry["name"]
+                    for entry in KNOWN_FACE_ENCODINGS
+                    if entry.get("profile_id") == target_profile_id
+                ),
+                target_profile_id or "selected victim",
+            )
+            detection_summary = (
+                f"Searching for {target_name}. Selected victim not found in this frame."
+            )
+            record_detection_result(
+                "victim_search",
+                details="No selected victim match in the current camera frame.",
+                location=location,
+                profile_id=target_profile_id or "",
+            )
 
     st.session_state.last_status = detection_summary
     return annotated_frame, detection_summary
@@ -563,8 +757,24 @@ def render_detection_result(container) -> None:
     previous_timestamp = result.get("previous_timestamp", "")
     previous_location = result.get("previous_location", "")
     current_location = result.get("location", "")
+    profile_id = result.get("profile_id", "")
 
-    if result_type == "known_match":
+    if result_type == "victim_found":
+        panel.success(f"VICTIM FOUND: {subject}{distance_text}")
+        panel.markdown(f"**Camera location:** {current_location or 'Location unavailable'}")
+        history = get_victim_sighting_history(profile_id)
+        if not history.empty:
+            panel.write("**Victim sighting history by location**")
+            panel.dataframe(
+                history[["timestamp", "location"]].rename(
+                    columns={"timestamp": "Last seen", "location": "Camera location"}
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+    elif result_type == "victim_search":
+        panel.info("SEARCHING: Selected victim was not found in the current frame.")
+    elif result_type == "known_match":
         panel.success(f"MATCH FOUND: {subject}{distance_text}")
     elif result_type == "unknown_match":
         panel.warning(f"PREVIOUS UNKNOWN MATCH: {subject}{distance_text}")
@@ -612,7 +822,10 @@ def configure_session_state() -> None:
             "location": "",
             "previous_timestamp": "",
             "previous_location": "",
+            "profile_id": "",
         },
+        "camera_location": "Main Feed",
+        "victim_search_target": None,
         "last_logged_event": "",
         "active_alerts": [],
         "login_attempts": 0, "login_locked_until": 0.0,
@@ -705,7 +918,7 @@ def save_registered_profile(
     if crop is None:
         return False, message
 
-    prefix = "Lost" if "Lost" in role_label else "Member"
+    prefix = "Victim" if "Victim" in role_label or "Lost" in role_label else "Staff"
     safe_name = "".join(
         character if character.isalnum() else "_" for character in name
     ).strip("_")
@@ -724,6 +937,8 @@ def clear_audit_log() -> None:
     """Clear audit records. This operation is available to Administrators only."""
     if CSV_LOG_PATH.exists():
         CSV_LOG_PATH.unlink()
+    if VICTIM_SIGHTING_LOG_PATH.exists():
+        VICTIM_SIGHTING_LOG_PATH.unlink()
     initialize_log_files()
 
 
@@ -834,7 +1049,7 @@ def render_sidebar() -> None:
             reg_name = st.text_input("Full Name / Identifier")
             reg_role = st.selectbox(
                 "Classification Role",
-                ["Lost Person / Victim", "Registered Member / Staff"],
+                ["Staff", "Victim"],
             )
             submitted = st.form_submit_button("Save Profile")
             if submitted:
@@ -943,19 +1158,51 @@ def render_main_ui() -> None:
     elif source_type == "IP Camera Stream":
         video_target = st.text_input("Enter RTSP / HTTP Stream URL", placeholder="rtsp://...")
 
+    camera_location = st.text_input(
+        "Camera location",
+        key="camera_location",
+        help="This location is saved with unknown tracking and victim sightings.",
+    ).strip() or "Main Feed"
+
     st.markdown("---")
     log_df = pd.read_csv(CSV_LOG_PATH) if CSV_LOG_PATH.exists() and CSV_LOG_PATH.stat().st_size > 0 else pd.DataFrame()
-    unk_df = pd.read_csv(UNKNOWN_DB_PATH) if UNKNOWN_DB_PATH.exists() and UNKNOWN_DB_PATH.stat().st_size > 0 else pd.DataFrame()
+    registered_df = get_registered_profiles_df()
+
+    victim_search_target = None
+    if is_victim_search_mode(mode):
+        victim_profiles = registered_df[registered_df["category"] == "Victim"]
+        if victim_profiles.empty:
+            st.warning("No Victim profile is registered. An Administrator must register a Victim first.")
+        else:
+            victim_labels = {
+                row["profile_id"]: row["name"]
+                for _, row in victim_profiles.iterrows()
+            }
+            victim_search_target = st.selectbox(
+                "Victim to search for",
+                options=list(victim_labels),
+                format_func=lambda profile_id: victim_labels[profile_id],
+                key="victim_search_target",
+                help="Only this Victim profile will be shown as a match. Other faces are tracked silently as unknown.",
+            )
+            st.caption(
+                "Victim search mode matches only the selected Victim. Unknown faces are saved silently for later review."
+            )
+
     col_m1, col_m2, col_m3, col_m4 = st.columns(4)
     col_m1.metric("Active Role", st.session_state.role)
-    col_m2.metric("Registered Profiles", get_registered_profile_count())
-    col_m3.metric("Unknowns Logged", len(unk_df))
+    col_m2.metric("Registered Faces", len(registered_df))
+    col_m3.metric("Unknown Faces", get_unknown_face_count())
     col_m4.metric("Total Log Events", len(log_df))
+
+    render_face_inventory_panel(registered_df)
 
     button_label = "Stop Surveillance" if st.session_state.streaming else "Start Surveillance"
     if st.button(button_label, width='stretch', type="primary" if not st.session_state.streaming else "secondary"):
         if not st.session_state.streaming and video_target is None:
             st.error("Cannot start stream: no valid video source selected.")
+        elif not st.session_state.streaming and is_victim_search_mode(mode) and not victim_search_target:
+            st.error("Select a Victim profile before starting Lost Person Search.")
         else:
             st.session_state.streaming = not st.session_state.streaming
             st.rerun()
@@ -981,7 +1228,12 @@ def render_main_ui() -> None:
                     st.rerun()
                     break
                 
-                annotated_frame, detection_summary = process_frame(frame, mode)
+                annotated_frame, detection_summary = process_frame(
+                    frame,
+                    mode,
+                    target_profile_id=victim_search_target,
+                    location=camera_location,
+                )
                 
                 status_text = st.session_state.get('last_status', "Idle")
                 status_area.info(f"Last Status: {status_text}")
@@ -995,6 +1247,47 @@ def render_main_ui() -> None:
             cap.release()
     else:
         frame_placeholder.info("Surveillance feed is offline. Select a source and start the stream.")
+
+
+def render_face_inventory_panel(registered_df: pd.DataFrame | None = None) -> None:
+    """Show registered-face categories and counts to Administrators and Operators."""
+    profiles = registered_df if registered_df is not None else get_registered_profiles_df()
+    staff_count = int((profiles["category"] == "Staff").sum()) if not profiles.empty else 0
+    victim_count = int((profiles["category"] == "Victim").sum()) if not profiles.empty else 0
+
+    st.markdown("---")
+    st.subheader("Registered face inventory")
+    count_col1, count_col2, count_col3 = st.columns(3)
+    count_col1.metric("All registered faces", len(profiles))
+    count_col2.metric("Staff", staff_count)
+    count_col3.metric("Victim", victim_count)
+
+    with st.container(border=True):
+        selected_category = st.segmented_control(
+            "Show registered faces",
+            ["All", "Staff", "Victim"],
+            default="All",
+            key="registered_face_category",
+            width="stretch",
+        ) or "All"
+        visible_profiles = profiles
+        if selected_category != "All":
+            visible_profiles = profiles[profiles["category"] == selected_category]
+
+        if visible_profiles.empty:
+            st.info(f"No {selected_category.lower()} profiles registered yet.")
+        else:
+            st.dataframe(
+                visible_profiles[["name", "category", "file_name"]].rename(
+                    columns={
+                        "name": "Name",
+                        "category": "Category",
+                        "file_name": "Profile file",
+                    }
+                ),
+                hide_index=True,
+                width="stretch",
+            )
 
 
 def render_facial_analytics_panel() -> None:
@@ -1108,6 +1401,24 @@ def render_log_viewer() -> None:
             st.info("Unknown person database is empty.")
     else:
         st.info("No unknown persons recorded yet.")
+
+    st.subheader("Victim sighting history")
+    victim_history = get_victim_sighting_history()
+    if victim_history.empty:
+        st.info("No Victim sightings recorded yet.")
+    else:
+        st.dataframe(
+            victim_history[["name", "timestamp", "location"]].rename(
+                columns={
+                    "name": "Victim",
+                    "timestamp": "Last seen",
+                    "location": "Camera location",
+                }
+            ),
+            hide_index=True,
+            width="stretch",
+            height=300,
+        )
 
 
 def main() -> None:

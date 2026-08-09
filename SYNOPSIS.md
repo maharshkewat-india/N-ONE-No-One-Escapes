@@ -13,7 +13,7 @@ N-ONE is an Advanced Multi-Mode AI Surveillance & Threat Tracking Platform desig
 *   **Role-Based Access Control (RBAC):** Ensures secure operation with distinct access levels for Admin and Operator roles, enhancing system integrity and data protection.
 *   **Comprehensive Audit & Logging:** Real-time CSV logging and downloadable interactive data tables facilitate thorough post-event analysis, compliance, and operational transparency.
 *   **Proactive Threat Detection:** Incorporates heuristic/contour analysis and deep learning models for early detection of hazardous objects and weapons, significantly improving security posture.
-*   **Persistent Unknown Person Tracking:** Automatically registers, logs, and re-identifies unknown individuals in attendance mode, building a database of all persons sighted.
+*   **Persistent Unknown Person Tracking:** Automatically registers, logs, and re-identifies unknown individuals; during Victim Search this tracking is silent while only the selected Victim is shown.
 
 ### Limitations:
 *   **Environmental Dependencies:** Performance of computer vision models can be affected by lighting conditions, occlusions, camera angle, and image quality.
@@ -195,3 +195,16 @@ The project's reliance on established libraries mitigates significant software d
 7.  **RTSP (Real-Time Streaming Protocol) RFC 2326.** (Describes the protocol for controlling the delivery of data with real-time properties). [Surveillance Standards - Streaming Protocol]
 8.  **Streamlit Documentation.** Retrieved from `https://docs.streamlit.io/` [Modern UI/Dashboard Development]
 9.  **Pandas Development Team. (Current Year).** *pandas: powerful Python data analysis and manipulation library*. Retrieved from `https://pandas.pydata.org/` [Data Analysis & Logging]
+
+## 9. Current implementation update (2026-08-09)
+
+The current application extends the original synopsis with the following operational behavior:
+
+- The Administrator and Operator dashboards both show registered-face and unknown-face totals.
+- Registered profiles are classified as `Staff` or `Victim`. Existing `Member_` files remain Staff and existing `Lost_` files remain Victim.
+- The registered-face inventory can be filtered with `All`, `Staff`, and `Victim` options.
+- `Lost Person Search` requires the operator to select a Victim target. Only that selected Victim is eligible for a visible match.
+- Other faces are silently stored or re-identified as unknowns. Their IDs are not drawn on the Victim-search screen.
+- The operator supplies a camera location. A successful Victim match displays the Victim name, current location, and the latest sighting for each previously recorded location.
+- Victim sightings are stored in `detection_logs/victim_sighting_log.csv`; unknown data remains in `unknown_person_db.csv` and `unknown_sighting_log.csv`.
+- A browser/network disconnect during the synchronous live loop can produce Windows `WinError 10054`. This is a closed Streamlit client connection, not an identity-match result.

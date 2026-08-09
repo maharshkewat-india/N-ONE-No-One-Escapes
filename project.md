@@ -9,8 +9,8 @@ The platform integrates real-time video stream analysis with sophisticated facia
 ## 2. Features
 
 - **Multi-Modal Surveillance:** Dynamically switch between:
-    - **Lost Person Search:** Scans for specific pre-registered individuals.
-    - **Member Attendance Logger:** Tracks registered members and logs unknown individuals.
+    - **Lost Person Search:** Scans only for the selected registered Victim.
+    - **Member Attendance Logger:** Tracks registered Staff and logs unknown individuals.
     - **Threat & Weapon Detection:** Detects hazardous objects using contour analysis and deep learning models.
 - **Role-Based Access Control (RBAC):** Secure login with `Administrator` and `Operator` roles to manage access to sensitive features like subject registration.
 - **Face-Only Registration:** Administrators can upload a profile photo or capture one through the browser camera. The system requires exactly one face, previews the detected crop, and saves only that face crop.
@@ -21,6 +21,15 @@ The platform integrates real-time video stream analysis with sophisticated facia
 - **Dynamic Video Ingestion:** Supports a wide range of video sources, including local webcams, pre-recorded video files, and RTSP/TCP streams from IP cameras.
 - **Structured Audit & Logging:** All significant events are logged to CSV files with timestamps, available for download and analysis through the UI.
 - **Intuitive User Interface:** A modern, dark-themed dashboard built with Streamlit provides real-time video feeds, system controls, and data visualization.
+
+## 8. Current implementation notes (2026-08-09)
+
+- The dashboard is shared by Administrators and Operators and shows registered-face and unknown-face counts.
+- Registered profiles are classified as `Staff` or `Victim`; legacy `Member_` and `Lost_` filename prefixes remain supported.
+- The registered-face inventory supports `All`, `Staff`, and `Victim` filters.
+- Lost Person Search uses a selected Victim target only. Unknown faces continue to be saved/re-identified silently while the target is being searched.
+- Victim matches show the name, current camera location, and the latest sighting per known location. These records are written to `detection_logs/victim_sighting_log.csv`.
+- For the complete test suite used by this project, run `python -m pytest tests -q`.
 
 ## 3. System Architecture
 
@@ -33,7 +42,7 @@ N-ONE uses a modular, three-layered architecture:
     - Running weapon detection heuristics.
     - Annotating video frames with status updates.
 3.  **Storage Layer:** Manages all persistent data on the file system:
-    - `registered_faces/`: Stores images of registered members and lost persons.
+    - `registered_faces/`: Stores face crops for registered Staff and Victim profiles.
     - `unknown_faces/`: Stores images of automatically detected unknown individuals.
     - `detection_logs/`: Contains all CSV audit logs.
     - `unknown_person_db.csv`: A database of unique unknown persons.
@@ -44,8 +53,9 @@ N-ONE uses a modular, three-layered architecture:
 2.  The Processing Layer captures video frames using OpenCV.
 3.  Based on the active mode, the frame is processed for facial recognition or threat detection.
 4.  Results are annotated on the live video feed. The UI distinguishes registered matches, previous-unknown matches, newly saved unknowns, and no-face events.
-5.  In "Member Attendance" mode, a previous-unknown match reads the last timestamp/location from `unknown_sighting_log.csv`, displays it, and then records the current sighting.
-5.  All events are appended to the appropriate CSV log file and displayed in the UI.
+5.  In "Lost Person Search", only the selected Victim can be shown as a visible match; other faces continue through silent unknown tracking.
+6.  In "Member Attendance" mode, a previous-unknown match reads the last timestamp/location from `unknown_sighting_log.csv`, displays it, and then records the current sighting.
+7.  All events are appended to the appropriate CSV log file and displayed in the UI.
 
 ## 4. Technology Stack
 

@@ -90,7 +90,7 @@ The first command is the safest option because it directly uses the project's in
 *   **Face-Only Profile Capture:** Administrator registration supports browser camera capture or upload, validates exactly one face, previews the crop, and saves only the face region.
 *   **Comprehensive Audit & Logging:** Real-time CSV logging and downloadable interactive data tables facilitate thorough post-event analysis, compliance, and operational transparency.
 *   **Proactive Threat Detection:** Incorporates heuristic/contour analysis and deep learning models for early detection of hazardous objects and weapons, significantly improving security posture.
-*   **Persistent Unknown Person Tracking:** Automatically registers, logs, and re-identifies unknown individuals in attendance mode, including the previous sighting date/time/location in the live result.
+*   **Persistent Unknown Person Tracking:** Automatically registers, logs, and re-identifies unknown individuals in face-recognition modes; during Victim Search this tracking is silent while only the selected Victim can be shown.
 
 ### Limitations:
 *   **Environmental Dependencies:** Performance of computer vision models can be affected by lighting conditions, occlusions, camera angle, and image quality.
@@ -276,3 +276,30 @@ It is important to note that while the N-ONE platform itself is licensed under M
 7.  **RTSP (Real-Time Streaming Protocol) RFC 2326.** (Describes the protocol for controlling the delivery of data with real-time properties). [Surveillance Standards - Streaming Protocol]
 8.  **Streamlit Documentation.** Retrieved from `https://docs.streamlit.io/` [Modern UI/Dashboard Development]
 9.  **Pandas Development Team. (Current Year).** *pandas: powerful Python data analysis and manipulation library*. Retrieved from `https://pandas.pydata.org/` [Data Analysis & Logging]
+
+## 10. Current operational workflow
+
+### Dashboard inventory
+
+Both authenticated roles (`Administrator` and `Operator`) see the command-center inventory. It displays total registered faces, total unknown faces, and a registered-face table filterable by `All`, `Staff`, or `Victim`. Administrators can register a face from an upload or browser camera capture; registration requires exactly one face and stores only the face crop.
+
+Profile filenames use the `Staff_<name>.jpg` or `Victim_<name>.jpg` convention. Legacy `Member_` profiles are treated as Staff and legacy `Lost_` profiles as Victim so existing data remains usable.
+
+### Victim-only search
+
+In `1. Lost Person Search`, the operator selects one registered Victim and enters the camera location. The recognition pipeline compares faces only with that selected Victim. Staff, other Victims, and unknown faces are not shown as match results. Unmatched faces are still saved or re-identified silently in `unknown_faces/`, `unknown_person_db.csv`, and `unknown_sighting_log.csv`.
+
+When the selected Victim is found, the dashboard shows the Victim name, the current camera location, and the latest sighting for each location in `detection_logs/victim_sighting_log.csv`. The same history is available in the log viewer.
+
+### Streaming note
+
+The current live-feed implementation uses a synchronous OpenCV loop. If a browser tab is refreshed or closed while streaming, Windows may print `ConnectionResetError: [WinError 10054]`; this means the Streamlit browser connection was closed by the client and is not a face-match failure. Stop the stream before refreshing when possible.
+
+### Verification
+
+```powershell
+python -m pytest tests -q
+python -m py_compile app.py deepface_adapter.py
+```
+
+*Last implementation update: 2026-08-09.*
