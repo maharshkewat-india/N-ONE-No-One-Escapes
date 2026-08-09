@@ -19,6 +19,7 @@ This document describes the behavior implemented in `app.py`. The application us
 3. **Dashboard inventory**
    - Both authenticated roles see counts for registered faces and unique unknown faces.
    - The registered inventory can be filtered to `All`, `Staff`, or `Victim`.
+   - A read-only photo viewer lets authenticated users select and view a Registered, Victim, or Unknown face image with available metadata.
 
 4. **Normal recognition modes**
    - Each frame is represented by the configured DeepFace/OpenCV backend.

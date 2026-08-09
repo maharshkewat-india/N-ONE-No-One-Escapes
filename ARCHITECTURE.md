@@ -74,6 +74,8 @@ project_n_one/
 
 Both `Administrator` and `Operator` sessions can view the dashboard inventory: total registered faces, total unknown faces, and registered profiles filtered by `All`, `Staff`, or `Victim`. Only Administrators can register profiles or change model settings.
 
+The same dashboard provides a read-only photo viewer with `Registered`, `Victim`, and `Unknown` categories. Selecting an entry displays the stored face image and the relevant profile or sighting metadata.
+
 `1. Lost Person Search` requires one Victim target. The processing layer restricts known-face matching to that target profile. Other registered faces and unknown faces are not shown as match results; unmatched faces are still saved or re-identified in the unknown store. The operator-provided camera location is saved with unknown sightings and successful Victim sightings.
 
 Victim location history is stored in `detection_logs/victim_sighting_log.csv`. Unknown data remains in `unknown_person_db.csv`, `unknown_sighting_log.csv`, and `unknown_faces/`.

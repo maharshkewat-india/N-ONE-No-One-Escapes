@@ -27,6 +27,7 @@ The platform integrates real-time video stream analysis with sophisticated facia
 - The dashboard is shared by Administrators and Operators and shows registered-face and unknown-face counts.
 - Registered profiles are classified as `Staff` or `Victim`; legacy `Member_` and `Lost_` filename prefixes remain supported.
 - The registered-face inventory supports `All`, `Staff`, and `Victim` filters.
+- The dashboard photo viewer supports `Registered`, `Victim`, and `Unknown` selections and displays the stored face image with profile/sighting details.
 - Lost Person Search uses a selected Victim target only. Unknown faces continue to be saved/re-identified silently while the target is being searched.
 - Victim matches show the name, current camera location, and the latest sighting per known location. These records are written to `detection_logs/victim_sighting_log.csv`.
 - For the complete test suite used by this project, run `python -m pytest tests -q`.

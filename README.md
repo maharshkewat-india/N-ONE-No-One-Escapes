@@ -279,11 +279,11 @@ It is important to note that while the N-ONE platform itself is licensed under M
 
 ## 10. Current operational workflow
 
-### Dashboard inventory
+### Dashboard inventory and photo viewer
 
 Both authenticated roles (`Administrator` and `Operator`) see the command-center inventory. It displays total registered faces, total unknown faces, and a registered-face table filterable by `All`, `Staff`, or `Victim`. Administrators can register a face from an upload or browser camera capture; registration requires exactly one face and stores only the face crop.
 
-Profile filenames use the `Staff_<name>.jpg` or `Victim_<name>.jpg` convention. Legacy `Member_` profiles are treated as Staff and legacy `Lost_` profiles as Victim so existing data remains usable.
+Profile filenames use the `Staff_<name>.jpg` or `Victim_<name>.jpg` convention. Legacy `Member_` profiles are treated as Staff and legacy `Lost_` profiles as Victim so existing data remains usable. The same dashboard includes a photo viewer with `Registered`, `Victim`, and `Unknown` options; users can select a profile and view its stored face crop plus available metadata.
 
 ### Victim-only search
 

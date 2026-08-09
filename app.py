@@ -186,12 +186,13 @@ def get_registered_profiles_df() -> pd.DataFrame:
                 "name": get_profile_name(image_path.stem),
                 "category": get_profile_category(image_path.stem),
                 "file_name": image_path.name,
+                "image_path": str(image_path),
             }
         )
 
     return pd.DataFrame(
         profiles,
-        columns=["profile_id", "name", "category", "file_name"],
+        columns=["profile_id", "name", "category", "file_name", "image_path"],
     ).sort_values(["category", "name"], ignore_index=True)
 
 
@@ -217,6 +218,61 @@ def get_unknown_face_count() -> int:
         1
         for image_path in UNKNOWN_DIR.iterdir()
         if image_path.is_file() and image_path.suffix.lower() in PROFILE_IMAGE_SUFFIXES
+    )
+
+
+def get_unknown_profiles_df() -> pd.DataFrame:
+    """Return unknown profiles with a usable image path for the dashboard gallery."""
+    columns = [
+        "unknown_id",
+        "image_path",
+        "first_seen_timestamp",
+        "last_seen_timestamp",
+        "last_known_location",
+        "assigned_name",
+    ]
+    records = []
+    try:
+        unknown_df = pd.read_csv(UNKNOWN_DB_PATH)
+    except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        unknown_df = pd.DataFrame(columns=columns)
+
+    if "unknown_id" in unknown_df.columns:
+        for _, row in unknown_df.drop_duplicates("unknown_id").iterrows():
+            unknown_id = str(row.get("unknown_id", ""))
+            if not unknown_id or unknown_id == "nan":
+                continue
+            image_path = UNKNOWN_DIR / f"{unknown_id}.jpg"
+            stored_path = str(row.get("image_path", ""))
+            if not image_path.exists() and stored_path and stored_path != "nan":
+                image_path = Path(stored_path)
+            records.append(
+                {
+                    "unknown_id": unknown_id,
+                    "image_path": str(image_path),
+                    "first_seen_timestamp": str(row.get("first_seen_timestamp", "")),
+                    "last_seen_timestamp": str(row.get("last_seen_timestamp", "")),
+                    "last_known_location": str(row.get("last_known_location", "")),
+                    "assigned_name": str(row.get("assigned_name", "")),
+                }
+            )
+
+    if not records and UNKNOWN_DIR.exists():
+        for image_path in sorted(UNKNOWN_DIR.iterdir()):
+            if image_path.is_file() and image_path.suffix.lower() in PROFILE_IMAGE_SUFFIXES:
+                records.append(
+                    {
+                        "unknown_id": image_path.stem,
+                        "image_path": str(image_path),
+                        "first_seen_timestamp": "",
+                        "last_seen_timestamp": "",
+                        "last_known_location": "",
+                        "assigned_name": "",
+                    }
+                )
+
+    return pd.DataFrame(records, columns=columns).sort_values(
+        "unknown_id", ignore_index=True
     )
 
 
@@ -1196,6 +1252,7 @@ def render_main_ui() -> None:
     col_m4.metric("Total Log Events", len(log_df))
 
     render_face_inventory_panel(registered_df)
+    render_face_photo_gallery(registered_df)
 
     button_label = "Stop Surveillance" if st.session_state.streaming else "Start Surveillance"
     if st.button(button_label, width='stretch', type="primary" if not st.session_state.streaming else "secondary"):
@@ -1288,6 +1345,90 @@ def render_face_inventory_panel(registered_df: pd.DataFrame | None = None) -> No
                 hide_index=True,
                 width="stretch",
             )
+
+
+def render_face_photo_gallery(registered_df: pd.DataFrame | None = None) -> None:
+    """Let authenticated users view a selected registered, Victim, or unknown photo."""
+    profiles = registered_df if registered_df is not None else get_registered_profiles_df()
+    st.markdown("---")
+    st.subheader("Face photo viewer")
+
+    gallery_category = st.segmented_control(
+        "Photo category",
+        ["Registered", "Victim", "Unknown"],
+        default="Registered",
+        key="photo_view_category",
+        width="stretch",
+    ) or "Registered"
+
+    selected_record = None
+    if gallery_category in {"Registered", "Victim"}:
+        candidates = profiles
+        if gallery_category == "Victim":
+            candidates = candidates[candidates["category"] == "Victim"]
+
+        if candidates.empty:
+            st.info(f"No {gallery_category.lower()} photos available.")
+            return
+
+        labels = {
+            row["profile_id"]: f"{row['name']} ({row['category']})"
+            for _, row in candidates.iterrows()
+        }
+        selected_id = st.selectbox(
+            f"Select {gallery_category.lower()} profile",
+            options=list(labels),
+            format_func=lambda profile_id: labels[profile_id],
+            key="selected_photo_profile",
+        )
+        selected_record = candidates[candidates["profile_id"] == selected_id].iloc[0]
+    else:
+        unknown_profiles = get_unknown_profiles_df()
+        if unknown_profiles.empty:
+            st.info("No unknown photos available.")
+            return
+
+        selected_id = st.selectbox(
+            "Select unknown profile",
+            options=unknown_profiles["unknown_id"].tolist(),
+            key="selected_unknown_photo",
+        )
+        selected_record = unknown_profiles[
+            unknown_profiles["unknown_id"] == selected_id
+        ].iloc[0]
+
+    image_path = Path(str(selected_record["image_path"]))
+    with st.container(border=True):
+        photo_col, details_col = st.columns([1, 2])
+        with photo_col:
+            if image_path.exists():
+                st.image(
+                    str(image_path),
+                    caption=image_path.name,
+                    width="content",
+                )
+            else:
+                st.warning("Photo file is not available at the stored path.")
+
+        with details_col:
+            if gallery_category in {"Registered", "Victim"}:
+                st.write(f"**Name:** {selected_record['name']}")
+                st.write(f"**Category:** {selected_record['category']}")
+                st.write(f"**Profile ID:** `{selected_record['profile_id']}`")
+            else:
+                st.write(f"**Unknown ID:** `{selected_record['unknown_id']}`")
+                assigned_name = selected_record.get("assigned_name", "")
+                if assigned_name and assigned_name != "nan":
+                    st.write(f"**Assigned name:** {assigned_name}")
+                st.write(
+                    f"**First seen:** {selected_record.get('first_seen_timestamp', '') or 'Unavailable'}"
+                )
+                st.write(
+                    f"**Last seen:** {selected_record.get('last_seen_timestamp', '') or 'Unavailable'}"
+                )
+                st.write(
+                    f"**Last location:** {selected_record.get('last_known_location', '') or 'Unavailable'}"
+                )
 
 
 def render_facial_analytics_panel() -> None:

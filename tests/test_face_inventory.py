@@ -69,3 +69,32 @@ def test_known_face_cache_can_be_limited_to_one_victim(monkeypatch) -> None:
 
     assert match is not None
     assert match["profile_id"] == "Victim_b"
+
+
+def test_unknown_gallery_resolves_current_image_path(monkeypatch) -> None:
+    test_dir = Path(__file__).parent / f"_face_inventory_{uuid4().hex}"
+    unknown_dir = test_dir / "unknown_faces"
+    unknown_dir.mkdir(parents=True)
+    image_path = unknown_dir / "unknown_001.jpg"
+    image_path.touch()
+    unknown_db = test_dir / "unknown_person_db.csv"
+    try:
+        pd.DataFrame(
+            {
+                "unknown_id": ["unknown_001"],
+                "image_path": ["old/path/unknown_001.jpg"],
+                "first_seen_timestamp": ["2026-08-09 10:00:00"],
+                "last_seen_timestamp": ["2026-08-09 11:00:00"],
+                "last_known_location": ["Gate 1"],
+                "assigned_name": [""],
+            }
+        ).to_csv(unknown_db, index=False)
+
+        monkeypatch.setattr(app, "UNKNOWN_DIR", unknown_dir)
+        monkeypatch.setattr(app, "UNKNOWN_DB_PATH", unknown_db)
+        gallery = app.get_unknown_profiles_df()
+
+        assert len(gallery) == 1
+        assert Path(gallery.iloc[0]["image_path"]) == image_path
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)

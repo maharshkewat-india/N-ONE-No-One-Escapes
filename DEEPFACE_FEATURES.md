@@ -403,6 +403,10 @@ Unknown faces are still sent through the existing unknown database workflow. New
 
 The operator supplies a camera location. When the selected Victim matches, the app records the profile ID, name, timestamp, and location in `detection_logs/victim_sighting_log.csv`. Duplicate frames at the same camera are throttled for 60 seconds, and the UI shows the latest sighting for each distinct location.
 
+### Dashboard photo viewer
+
+Authenticated users can open the read-only photo viewer and choose `Registered`, `Victim`, or `Unknown`. The selected face crop is displayed from the local profile/unknown store; unknown entries also show first-seen, last-seen, assigned-name, and last-location metadata when available.
+
 ### Current verification
 
 ```powershell

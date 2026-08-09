@@ -203,6 +203,7 @@ The current application extends the original synopsis with the following operati
 - The Administrator and Operator dashboards both show registered-face and unknown-face totals.
 - Registered profiles are classified as `Staff` or `Victim`. Existing `Member_` files remain Staff and existing `Lost_` files remain Victim.
 - The registered-face inventory can be filtered with `All`, `Staff`, and `Victim` options.
+- The dashboard photo viewer lets authenticated users select and view a stored photo from `Registered`, `Victim`, or `Unknown` categories.
 - `Lost Person Search` requires the operator to select a Victim target. Only that selected Victim is eligible for a visible match.
 - Other faces are silently stored or re-identified as unknowns. Their IDs are not drawn on the Victim-search screen.
 - The operator supplies a camera location. A successful Victim match displays the Victim name, current location, and the latest sighting for each previously recorded location.
