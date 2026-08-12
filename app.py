@@ -105,9 +105,157 @@ DEEPFACE_BACKEND = "opencv"
 DEEPFACE_METRIC = "cosine"
 COSINE_THRESHOLD = 0.40
 PROFILE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+ENROLLMENT_ANGLES = ("front", "left", "right", "up", "down")
+ENROLLMENT_INSTRUCTIONS = {
+    "front": "Look straight at the camera. Keep your face relaxed.",
+    "left": "Slowly turn your face to the LEFT and hold still.",
+    "right": "Slowly turn your face to the RIGHT and hold still.",
+    "up": "Tilt your face slightly UP and hold still.",
+    "down": "Tilt your face slightly DOWN and hold still.",
+}
 
 # --- In-memory Cache ---
 KNOWN_FACE_ENCODINGS = []
+UNKNOWN_FACE_ENCODINGS: list[dict] = []
+UNKNOWN_FACE_CACHE_SETTINGS: tuple[str, str] | None = None
+UNKNOWN_FACE_CACHE_VERSION = 0
+UNKNOWN_FACE_CACHE_BUILT_VERSION = -1
+UNKNOWN_SIGHTING_WRITE_INTERVAL_SECONDS = 2.0
+UNKNOWN_SIGHTING_LAST_WRITE: dict[tuple[str, str], float] = {}
+UNKNOWN_SIGHTING_MEMORY: dict[str, dict[str, str]] = {}
+THREAT_LOG_INTERVAL_SECONDS = 2.0
+LAST_THREAT_LOG_TIME = 0.0
+PROCESSING_MAX_WIDTH = 960
+
+
+def invalidate_unknown_face_cache() -> None:
+    """Mark the in-memory unknown-face index stale after a new registration."""
+    global UNKNOWN_FACE_CACHE_VERSION
+    UNKNOWN_FACE_CACHE_VERSION += 1
+
+
+def _represent_saved_unknown(
+    image_path: Path,
+    model_name: str,
+    detector_backend: str,
+) -> list[dict]:
+    """Represent a saved unknown, including cropped images without context."""
+    try:
+        representations = DeepFace.represent(
+            img_path=str(image_path),
+            model_name=model_name,
+            detector_backend=detector_backend,
+            enforce_detection=False,
+            align=True,
+            silent=True,
+        )
+        if representations:
+            return representations
+    except Exception:
+        pass
+
+    # Unknown images are face-only crops. The OpenCV fallback supports using
+    # the whole crop when its Haar detector cannot find a second face box.
+    try:
+        representations = DeepFace.represent(
+            img_path=str(image_path),
+            model_name=model_name,
+            detector_backend=detector_backend,
+            enforce_detection=False,
+            allow_full_image=True,
+            align=True,
+            silent=True,
+        )
+        return representations if representations else []
+    except Exception:
+        return []
+
+
+def ensure_unknown_face_cache(model_name: str, detector_backend: str) -> None:
+    """Build the unknown-face index once instead of scanning disk every frame."""
+    global UNKNOWN_FACE_CACHE_SETTINGS, UNKNOWN_FACE_CACHE_BUILT_VERSION
+
+    settings = (model_name, detector_backend)
+    if (
+        UNKNOWN_FACE_CACHE_SETTINGS == settings
+        and UNKNOWN_FACE_CACHE_BUILT_VERSION == UNKNOWN_FACE_CACHE_VERSION
+    ):
+        return
+
+    UNKNOWN_FACE_ENCODINGS.clear()
+    if UNKNOWN_DIR.exists():
+        for image_path in sorted(UNKNOWN_DIR.iterdir()):
+            if not image_path.is_file() or image_path.suffix.lower() not in PROFILE_IMAGE_SUFFIXES:
+                continue
+            representations = _represent_saved_unknown(
+                image_path, model_name, detector_backend
+            )
+            if representations and representations[0].get("embedding") is not None:
+                UNKNOWN_FACE_ENCODINGS.append(
+                    {
+                        "unknown_id": image_path.stem,
+                        "image_path": image_path,
+                        "encoding": representations[0]["embedding"],
+                    }
+                )
+
+    UNKNOWN_FACE_CACHE_SETTINGS = settings
+    UNKNOWN_FACE_CACHE_BUILT_VERSION = UNKNOWN_FACE_CACHE_VERSION
+
+
+def add_unknown_face_to_cache(
+    unknown_id: str,
+    face_encoding: list,
+    image_path: Path,
+    model_name: str,
+    detector_backend: str,
+) -> None:
+    """Add the current frame's embedding without rebuilding the whole index."""
+    ensure_unknown_face_cache(model_name, detector_backend)
+    for entry in UNKNOWN_FACE_ENCODINGS:
+        if entry.get("unknown_id") == unknown_id:
+            entry["encoding"] = face_encoding
+            entry["image_path"] = image_path
+            return
+    UNKNOWN_FACE_ENCODINGS.append(
+        {
+            "unknown_id": unknown_id,
+            "image_path": image_path,
+            "encoding": face_encoding,
+        }
+    )
+
+
+def find_face_in_unknown_cache(
+    face_encoding: list,
+    metric: str,
+    model_name: str,
+    detector_backend: str,
+) -> dict | None:
+    """Return the closest cached unknown within the selected metric threshold."""
+    ensure_unknown_face_cache(model_name, detector_backend)
+    thresholds = {"cosine": 0.4, "euclidean": 0.55, "euclidean_l2": 0.75}
+    threshold = thresholds.get(metric, 0.4)
+    best_match = None
+    best_distance = float("inf")
+
+    for entry in UNKNOWN_FACE_ENCODINGS:
+        try:
+            probe = np.asarray(face_encoding, dtype=np.float64)
+            reference = np.asarray(entry["encoding"], dtype=np.float64)
+            if probe.shape != reference.shape:
+                continue
+            distance = calculate_face_distance(face_encoding, entry["encoding"], metric)
+        except (TypeError, ValueError):
+            continue
+
+        if np.isfinite(distance) and distance < best_distance:
+            best_match = entry
+            best_distance = distance
+
+    if best_match is None or best_distance > threshold:
+        return None
+    return {**best_match, "distance": best_distance}
 
 
 def initialize_directories() -> None:
@@ -164,31 +312,66 @@ def get_next_unknown_id() -> str:
 
 def get_profile_category(profile_stem: str) -> str:
     """Normalize current and legacy profile prefixes to the dashboard labels."""
-    prefix = profile_stem.split("_", 1)[0].lower()
+    base_stem = profile_stem.split("__", 1)[0]
+    prefix = base_stem.split("_", 1)[0].lower()
     return "Victim" if prefix in {"victim", "lost"} else "Staff"
 
 
 def get_profile_name(profile_stem: str) -> str:
     """Return a readable profile name from a stored filename."""
-    _, separator, name = profile_stem.partition("_")
-    return (name if separator else profile_stem).replace("_", " ")
+    base_stem = profile_stem.split("__", 1)[0]
+    _, separator, name = base_stem.partition("_")
+    return (name if separator else base_stem).replace("_", " ")
+
+
+def get_profile_id(profile_stem: str) -> str:
+    """Return the shared ID used by all angle images in one profile."""
+    return profile_stem.split("__", 1)[0]
+
+
+def get_profile_angle(profile_stem: str) -> str:
+    """Return an angle suffix, or front for legacy single-photo profiles."""
+    return profile_stem.split("__", 1)[1] if "__" in profile_stem else "front"
+
+
+def get_profile_angle_paths(profile_id: str) -> dict[str, Path]:
+    """Return all saved angle images belonging to a profile."""
+    angle_paths: dict[str, Path] = {}
+    if not REG_DIR.exists():
+        return angle_paths
+    for image_path in REG_DIR.iterdir():
+        if not image_path.is_file() or image_path.suffix.lower() not in PROFILE_IMAGE_SUFFIXES:
+            continue
+        if get_profile_id(image_path.stem) != profile_id:
+            continue
+        angle = get_profile_angle(image_path.stem)
+        angle_paths.setdefault(angle, image_path)
+    return angle_paths
 
 
 def get_registered_profiles_df() -> pd.DataFrame:
     """Build the registered-face inventory used by both authenticated roles."""
-    profiles = []
+    profiles_by_id: dict[str, dict] = {}
     for image_path in REG_DIR.iterdir() if REG_DIR.exists() else []:
         if not image_path.is_file() or image_path.suffix.lower() not in PROFILE_IMAGE_SUFFIXES:
             continue
-        profiles.append(
-            {
-                "profile_id": image_path.stem,
-                "name": get_profile_name(image_path.stem),
-                "category": get_profile_category(image_path.stem),
+        profile_id = get_profile_id(image_path.stem)
+        angle = get_profile_angle(image_path.stem)
+        current = profiles_by_id.get(profile_id)
+        if current is None or (angle == "front" and current["angle"] != "front"):
+            profiles_by_id[profile_id] = {
+                "profile_id": profile_id,
+                "name": get_profile_name(profile_id),
+                "category": get_profile_category(profile_id),
                 "file_name": image_path.name,
                 "image_path": str(image_path),
+                "angle": angle,
             }
-        )
+
+    profiles = [
+        {key: value for key, value in record.items() if key != "angle"}
+        for record in profiles_by_id.values()
+    ]
 
     return pd.DataFrame(
         profiles,
@@ -281,6 +464,11 @@ def is_victim_search_mode(mode: str) -> bool:
     return mode.startswith("1.")
 
 
+def is_member_attendance_mode(mode: str) -> bool:
+    """Return whether registered profiles should be prioritized for attendance."""
+    return mode.startswith("2.")
+
+
 def record_victim_sighting(profile_id: str, name: str, location: str) -> bool:
     """Persist a victim sighting, throttling duplicate frames at one camera."""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -333,9 +521,21 @@ def get_victim_sighting_history(profile_id: str = "") -> pd.DataFrame:
     )
 
 
+def get_runtime_face_settings() -> tuple[str, str, str]:
+    """Return the face settings selected in the sidebar, with safe defaults."""
+    return (
+        str(st.session_state.get("selected_model", DEEPFACE_MODEL)),
+        str(st.session_state.get("selected_backend", DEEPFACE_BACKEND)),
+        str(st.session_state.get("selected_metric", DEEPFACE_METRIC)),
+    )
+
+
 @st.cache_resource
-def load_known_face_encodings():
-    """Loads all known face encodings from the registration directory into memory."""
+def load_known_face_encodings(
+    model_name: str = DEEPFACE_MODEL,
+    detector_backend: str = DEEPFACE_BACKEND,
+) -> None:
+    """Load registered encodings using the same detector settings as live frames."""
     if DeepFace is None:
         return
 
@@ -344,12 +544,18 @@ def load_known_face_encodings():
         if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
             continue
 
-        name = get_profile_name(img_path.stem)
-        role = get_profile_category(img_path.stem)
+        profile_id = get_profile_id(img_path.stem)
+        name = get_profile_name(profile_id)
+        role = get_profile_category(profile_id)
         embedding = None
         try:
             embedding_obj = DeepFace.represent(
-                img_path=str(img_path), model_name=DEEPFACE_MODEL, enforce_detection=False
+                img_path=str(img_path),
+                model_name=model_name,
+                detector_backend=detector_backend,
+                enforce_detection=False,
+                align=True,
+                silent=True,
             )
             if embedding_obj and len(embedding_obj) > 0:
                 embedding = embedding_obj[0].get("embedding")
@@ -358,12 +564,36 @@ def load_known_face_encodings():
 
         KNOWN_FACE_ENCODINGS.append(
             {
-                "profile_id": img_path.stem,
+                "profile_id": profile_id,
                 "name": name,
                 "role": role,
+                "angle": get_profile_angle(img_path.stem),
+                "image_path": str(img_path),
                 "encoding": embedding,
             }
         )
+
+
+def calculate_face_distance(
+    face_encoding: list,
+    reference_encoding: list,
+    metric: str = DEEPFACE_METRIC,
+) -> float:
+    """Calculate the selected distance metric with validation."""
+    probe = np.asarray(face_encoding, dtype=np.float64)
+    reference = np.asarray(reference_encoding, dtype=np.float64)
+    if probe.shape != reference.shape:
+        raise ValueError("Face embedding dimensions do not match")
+    if not np.all(np.isfinite(probe)) or not np.all(np.isfinite(reference)):
+        raise ValueError("Face embedding contains non-finite values")
+    if metric == "euclidean":
+        return float(np.linalg.norm(probe - reference))
+    if metric == "euclidean_l2":
+        return float(
+            np.linalg.norm(probe - reference)
+            / max(np.linalg.norm(probe) + np.linalg.norm(reference), 1e-8)
+        )
+    return float(cosine(probe, reference))
 
 
 def find_face_in_known_cache(
@@ -371,6 +601,7 @@ def find_face_in_known_cache(
     threshold: float = COSINE_THRESHOLD,
     profile_id: str | None = None,
     role: str | None = None,
+    metric: str = DEEPFACE_METRIC,
 ) -> dict | None:
     """Return the closest known profile when it is inside the match threshold."""
     best_match = None
@@ -382,7 +613,10 @@ def find_face_in_known_cache(
             continue
         if entry.get("encoding") is None:
             continue
-        distance = cosine(np.array(face_encoding), np.array(entry["encoding"]))
+        try:
+            distance = calculate_face_distance(face_encoding, entry["encoding"], metric)
+        except (TypeError, ValueError):
+            continue
         if distance < best_distance:
             best_match = entry
             best_distance = distance
@@ -419,7 +653,13 @@ def record_detection_result(
     }
 
 
-def register_new_unknown(face_roi: np.ndarray, location: str, mode: str) -> str:
+def register_new_unknown(
+    face_roi: np.ndarray,
+    location: str,
+    mode: str,
+    model_name: str = DEEPFACE_MODEL,
+    metric: str = DEEPFACE_METRIC,
+) -> str:
     """Registers a new unknown person, saves their image, logs the event, and updates the DB."""
     unknown_id = get_next_unknown_id()
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -436,11 +676,6 @@ def register_new_unknown(face_roi: np.ndarray, location: str, mode: str) -> str:
     log_sighting(unknown_id, timestamp, location)
     log_event(mode=mode, subject_id=unknown_id, role="Unknown", event_type="New Unknown Detected")
     
-    # Re-build the representations file for the unknown directory
-    if (UNKNOWN_DIR / "representations_facenet.pkl").exists():
-        (UNKNOWN_DIR / "representations_facenet.pkl").unlink()
-    DeepFace.find(img_path=str(image_path), db_path=str(UNKNOWN_DIR), model_name=DEEPFACE_MODEL, distance_metric=DEEPFACE_METRIC)
-
     return unknown_id
 
 
@@ -459,15 +694,21 @@ def log_sighting(unknown_id: str, timestamp: str, location: str) -> None:
 
 def get_last_unknown_sighting(unknown_id: str) -> dict[str, str]:
     """Read the last saved date/time and location before a new re-identification."""
+    cached_sighting = UNKNOWN_SIGHTING_MEMORY.get(str(unknown_id))
+    if cached_sighting:
+        return cached_sighting.copy()
+
     try:
         sighting_df = pd.read_csv(UNKNOWN_SIGHTING_LOG_PATH)
         matches = sighting_df[sighting_df["unknown_id"].astype(str) == unknown_id]
         if not matches.empty:
             last = matches.sort_values("timestamp").iloc[-1]
-            return {
+            result = {
                 "timestamp": str(last.get("timestamp", "")),
                 "location": str(last.get("location", "")),
             }
+            UNKNOWN_SIGHTING_MEMORY[str(unknown_id)] = result
+            return result.copy()
     except (FileNotFoundError, pd.errors.EmptyDataError, KeyError, IndexError):
         pass
 
@@ -476,18 +717,25 @@ def get_last_unknown_sighting(unknown_id: str) -> dict[str, str]:
         matches = unknown_df[unknown_df["unknown_id"].astype(str) == unknown_id]
         if not matches.empty:
             last = matches.iloc[-1]
-            return {
+            result = {
                 "timestamp": str(last.get("last_seen_timestamp", "")),
                 "location": str(last.get("last_known_location", "")),
             }
+            UNKNOWN_SIGHTING_MEMORY[str(unknown_id)] = result
+            return result.copy()
     except (FileNotFoundError, pd.errors.EmptyDataError, KeyError, IndexError):
         pass
 
     return {"timestamp": "", "location": ""}
 
 
-def update_unknown_sighting(unknown_id: str, location: str, mode: str) -> None:
-    """Updates the last seen timestamp/location for an unknown person and logs the event."""
+def update_unknown_sighting(unknown_id: str, location: str, mode: str) -> bool:
+    """Persist an unknown sighting at most once every few seconds."""
+    sighting_key = (str(unknown_id), location)
+    now = time.monotonic()
+    if now - UNKNOWN_SIGHTING_LAST_WRITE.get(sighting_key, 0.0) < UNKNOWN_SIGHTING_WRITE_INTERVAL_SECONDS:
+        return False
+
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         db_df = pd.read_csv(UNKNOWN_DB_PATH)
@@ -496,8 +744,14 @@ def update_unknown_sighting(unknown_id: str, location: str, mode: str) -> None:
         db_df.to_csv(UNKNOWN_DB_PATH, index=False)
         log_sighting(unknown_id, timestamp, location)
         log_event(mode=mode, subject_id=unknown_id, role="Unknown", event_type="Re-identified")
+        UNKNOWN_SIGHTING_LAST_WRITE[sighting_key] = now
+        UNKNOWN_SIGHTING_MEMORY[str(unknown_id)] = {
+            "timestamp": timestamp,
+            "location": location,
+        }
+        return True
     except (FileNotFoundError, pd.errors.EmptyDataError, IndexError):
-        pass
+        return False
 
 
 def analyze_facial_attributes(frame: np.ndarray, face_objs: list) -> list[dict]:
@@ -579,24 +833,72 @@ def get_face_embeddings(frame: np.ndarray, model: str = DEEPFACE_MODEL) -> list:
         return []
 
 
-def check_weapon_contours(frame) -> tuple[bool, list[tuple[int, int, int, int]]]:
-    """Heuristic-based weapon contour detection."""
+def check_weapon_contours(
+    frame: np.ndarray,
+) -> tuple[bool, list[tuple[int, int, int, int, str]]]:
+    """Detect possible elongated weapons and warm fire-like regions.
+
+    This is deliberately labelled heuristic: contours cannot prove that an
+    object is a gun or knife. A trained threat detector is required for that.
+    """
+    frame_height, frame_width = frame.shape[:2]
+    frame_area = max(frame_height * frame_width, 1)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    edges = cv2.Canny(blur, 50, 150)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 60, 180)
+    edges = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+    )
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    threat_found = False
-    boxes: list[tuple[int, int, int, int]] = []
+    boxes: list[tuple[int, int, int, int, str]] = []
+    min_contour_area = max(250.0, frame_area * 0.001)
+    max_contour_area = frame_area * 0.20
     for contour in contours:
         area = cv2.contourArea(contour)
-        if 900 < area < 18000:
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = float(w) / max(h, 1)
-            if aspect_ratio > 2.5 or aspect_ratio < 0.35:
-                boxes.append((x, y, w, h))
-                threat_found = True
-    return threat_found, boxes
+        if not min_contour_area <= area <= max_contour_area:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect_ratio = max(w, h) / max(min(w, h), 1)
+        contour_box_area = max(w * h, 1)
+        fill_ratio = area / contour_box_area
+        hull_area = max(cv2.contourArea(cv2.convexHull(contour)), 1.0)
+        solidity = area / hull_area
+        if aspect_ratio >= 2.5 and fill_ratio >= 0.08 and solidity >= 0.15:
+            boxes.append((x, y, w, h, "Possible weapon"))
+
+    # Fire often has no useful edge contour, so separately inspect saturated
+    # red/orange/yellow regions in HSV space.
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    warm_mask = cv2.inRange(
+        hsv,
+        np.array([0, 100, 100], dtype=np.uint8),
+        np.array([35, 255, 255], dtype=np.uint8),
+    )
+    warm_mask = cv2.morphologyEx(
+        warm_mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    warm_mask = cv2.morphologyEx(
+        warm_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+    )
+    fire_contours, _ = cv2.findContours(
+        warm_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    for contour in fire_contours:
+        area = cv2.contourArea(contour)
+        if area < max(400.0, frame_area * 0.002) or area > frame_area * 0.35:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        if area / max(w * h, 1) >= 0.12:
+            boxes.append((x, y, w, h, "Possible fire"))
+
+    return bool(boxes), boxes
 
 
 def process_frame(
@@ -606,10 +908,20 @@ def process_frame(
     location: str = "Main Feed",
 ) -> tuple[np.ndarray, str]:
     """The core processing pipeline for each video frame."""
-    annotated_frame = frame.copy()
+    processing_frame = frame
+    if frame.shape[1] > PROCESSING_MAX_WIDTH:
+        resize_ratio = PROCESSING_MAX_WIDTH / frame.shape[1]
+        processing_frame = cv2.resize(
+            frame,
+            (PROCESSING_MAX_WIDTH, max(1, int(frame.shape[0] * resize_ratio))),
+            interpolation=cv2.INTER_AREA,
+        )
+    annotated_frame = processing_frame.copy()
     detection_summary = "Status: Idle"
     victim_search = is_victim_search_mode(mode)
+    attendance_mode = is_member_attendance_mode(mode)
     victim_found = None
+    model_name, detector_backend, metric = get_runtime_face_settings()
 
     is_face_rec_mode = "Threat" not in mode
     
@@ -617,22 +929,40 @@ def process_frame(
     if not is_face_rec_mode:
         threat_detected, boxes = check_weapon_contours(annotated_frame)
         if threat_detected:
-            for x, y, w, h in boxes:
+            threat_labels = []
+            for x, y, w, h, threat_label in boxes:
                 cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                cv2.putText(annotated_frame, "THREAT ALERT", (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            detection_summary = "Threat contour heuristic alert!"
-            log_event(mode=mode, subject_id="System", role="N/A", event_type="Threat Detected", details="Contour analysis matched threat profile.")
+                cv2.putText(annotated_frame, threat_label, (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                threat_labels.append(threat_label)
+            detection_summary = "Possible threat: " + ", ".join(sorted(set(threat_labels)))
+            global LAST_THREAT_LOG_TIME
+            if time.monotonic() - LAST_THREAT_LOG_TIME >= THREAT_LOG_INTERVAL_SECONDS:
+                log_event(
+                    mode=mode,
+                    subject_id="System",
+                    role="N/A",
+                    event_type="Threat Detected",
+                    details="Heuristic alert: " + ", ".join(sorted(set(threat_labels))),
+                )
+                LAST_THREAT_LOG_TIME = time.monotonic()
         else:
             detection_summary = "No threats detected."
-        record_detection_result("no_threat", details=detection_summary)
+        record_detection_result(
+            "threat" if threat_detected else "no_threat",
+            details=detection_summary,
+        )
         st.session_state.last_status = detection_summary
         return annotated_frame, detection_summary
 
     # --- 2. Face Detection & Recognition (For all other modes) ---
     try:
         face_objs = DeepFace.represent(
-            img_path=frame, model_name=DEEPFACE_MODEL,
-            enforce_detection=False, detector_backend='opencv'
+            img_path=processing_frame,
+            model_name=model_name,
+            enforce_detection=False,
+            detector_backend=detector_backend,
+            align=True,
+            silent=True,
         )
     except Exception as e:
         st.session_state.last_status = f"DeepFace Error: {e}"
@@ -652,7 +982,7 @@ def process_frame(
         y = int(facial_area["y"])
         w = int(facial_area["w"])
         h = int(facial_area["h"])
-        face_roi = frame[y : y + h, x : x + w]
+        face_roi = processing_frame[y : y + h, x : x + w]
         if face_roi.size == 0:
             continue
             
@@ -669,19 +999,25 @@ def process_frame(
                     match_threshold,
                     profile_id=target_profile_id,
                     role="Victim",
+                    metric=metric,
                 )
                 if target_profile_id
                 else None
             )
         else:
-            known_match = find_face_in_known_cache(face_encoding, match_threshold)
+            known_match = find_face_in_known_cache(
+                face_encoding,
+                match_threshold,
+                metric=metric,
+            )
         if known_match:
             name, role = known_match["name"], known_match["role"]
             distance = known_match["distance"]
-            color = (0, 255, 0) if role == "Staff" else (255, 0, 0)
             if victim_search:
                 victim_found = known_match
-                color = (0, 255, 0)
+                # Red means the selected victim was positively found.
+                color = (0, 0, 255)
+                label = "VICTIM FOUND"
                 if record_victim_sighting(
                     known_match["profile_id"], name, location
                 ):
@@ -692,8 +1028,14 @@ def process_frame(
                         event_type="Victim Found",
                         details=f"Camera location: {location}",
                     )
+            elif attendance_mode:
+                # Registered/manual profiles always win before unknown search.
+                color = (0, 255, 0)
+                label = f"Known: {name}"
+            else:
+                color = (0, 255, 0) if role == "Staff" else (255, 0, 0)
+                label = f"{role}: {name}"
             cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
-            label = f"{role}: {name}"
             cv2.putText(annotated_frame, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
             detection_summary = f"Matched: {label} (distance {distance:.3f})"
             if victim_search:
@@ -711,29 +1053,29 @@ def process_frame(
                     subject=label,
                     distance=distance,
                     details="Matched against a registered profile.",
+                    location=location,
                 )
                 log_event(mode=mode, subject_id=name, role=role, event_type="Known Face Match")
             continue
 
-        # Step B: If not a known face, check against the UNKNOWN database on disk
-        try:
-            # Use DeepFace.find against the unknown faces directory. This is faster if DB is large.
-            dfs = DeepFace.find(
-                img_path=face_roi, db_path=str(UNKNOWN_DIR),
-                model_name=DEEPFACE_MODEL, distance_metric=DEEPFACE_METRIC,
-                enforce_detection=False, silent=True
+        # Step B: Check the in-memory unknown index. Disk/database I/O is
+        # intentionally not part of the per-frame recognition path.
+        unknown_match = find_face_in_unknown_cache(
+            face_encoding,
+            metric=metric,
+            model_name=model_name,
+            detector_backend=detector_backend,
+        )
+        if unknown_match:
+            unknown_id = str(unknown_match["unknown_id"])
+            match_path = Path(unknown_match["image_path"])
+            distance = float(unknown_match["distance"])
+            previous_sighting = (
+                get_last_unknown_sighting(unknown_id) if not victim_search else {}
             )
-            if dfs and not dfs[0].empty:
-                unknown_matches = dfs[0].sort_values("distance")
-                best_unknown = unknown_matches.iloc[0]
-                match_path = Path(best_unknown["identity"])
-                unknown_id = match_path.stem
-                distance = float(best_unknown.get("distance", 0.0))
-                previous_sighting = get_last_unknown_sighting(unknown_id)
-                update_unknown_sighting(unknown_id, location, mode)
-                if victim_search:
-                    continue
-                detection_summary = f"Re-identified previous unknown: {unknown_id} (distance {distance:.3f})"
+            update_unknown_sighting(unknown_id, location, mode)
+            detection_summary = f"Re-identified previous unknown: {unknown_id} (distance {distance:.3f})"
+            if not victim_search:
                 record_detection_result(
                     "unknown_match",
                     subject=unknown_id,
@@ -744,29 +1086,58 @@ def process_frame(
                     previous_timestamp=previous_sighting.get("timestamp", ""),
                     previous_location=previous_sighting.get("location", ""),
                 )
+            if victim_search:
+                # Other people are only context while searching; do not expose
+                # an unknown ID in the victim-search feed.
+                color = (0, 255, 0)
+                label = None
+            elif attendance_mode:
+                color = (0, 0, 255)
+                label = f"Unknown: {unknown_id}"
+            else:
                 color = (255, 165, 0) # Orange
-                cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
-                cv2.putText(annotated_frame, f"ID: {unknown_id}", (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                continue
-        except Exception:
-             # This can fail if UNKNOWN_DIR is empty, which is fine on first run.
-             pass
+                label = f"ID: {unknown_id}"
+            cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
+            if label:
+                cv2.putText(annotated_frame, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            continue
         
         # Step C: If not known and not previously unknown, register as a NEW UNKNOWN
-        unknown_id = register_new_unknown(face_roi, location, mode)
-        if victim_search:
-            continue
-        detection_summary = f"No registered match - saved as new unknown: {unknown_id}"
-        record_detection_result(
-            "new_unknown",
-            subject=unknown_id,
-            details="No known or previous-unknown match; face image was saved.",
-            image_name=f"{unknown_id}.jpg",
-            location=location,
+        unknown_id = register_new_unknown(
+            face_roi,
+            location,
+            mode,
+            model_name=model_name,
+            metric=metric,
         )
-        color = (255, 255, 0) # Cyan
+        add_unknown_face_to_cache(
+            unknown_id,
+            face_encoding,
+            UNKNOWN_DIR / f"{unknown_id}.jpg",
+            model_name,
+            detector_backend,
+        )
+        detection_summary = f"No registered match - saved as new unknown: {unknown_id}"
+        if not victim_search:
+            record_detection_result(
+                "new_unknown",
+                subject=unknown_id,
+                details="No known or previous-unknown match; face image was saved.",
+                image_name=f"{unknown_id}.jpg",
+                location=location,
+            )
+        if victim_search:
+            color = (0, 255, 0)
+            label = None
+        elif attendance_mode:
+            color = (0, 0, 255)
+            label = f"Unknown: {unknown_id}"
+        else:
+            color = (255, 255, 0) # Cyan
+            label = f"New ID: {unknown_id}"
         cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(annotated_frame, f"New ID: {unknown_id}", (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+        if label:
+            cv2.putText(annotated_frame, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
 
     if victim_search:
         if victim_found:
@@ -844,6 +1215,8 @@ def render_detection_result(container) -> None:
         panel.warning(f"NO MATCH - SAVED AS NEW UNKNOWN: {subject}")
     elif result_type == "no_face":
         panel.info("NO FACE DETECTED")
+    elif result_type == "threat":
+        panel.error(details or "Possible threat detected by heuristic analysis.")
     elif result_type == "error":
         panel.error(details or "Face analysis failed.")
     elif result_type == "no_threat":
@@ -851,7 +1224,7 @@ def render_detection_result(container) -> None:
     else:
         panel.info(details or "Waiting for a detection result.")
 
-    if details and result_type not in {"error", "no_threat"}:
+    if details and result_type not in {"error", "no_threat", "threat"}:
         panel.caption(details)
     if result.get("image_name"):
         image_path = UNKNOWN_DIR / result["image_name"]
@@ -963,16 +1336,15 @@ def prepare_single_face_crop(uploaded_file) -> tuple[np.ndarray | None, str]:
     return crop, "One face detected. Only the face crop will be saved."
 
 
-def save_registered_profile(
-    name: str, role_label: str, uploaded_file
+def save_registered_profile_captures(
+    name: str,
+    role_label: str,
+    captures: dict[str, object],
+    require_all_angles: bool = True,
 ) -> tuple[bool, str]:
-    """Save a face-only profile. This operation is Administrator-only."""
+    """Validate and save one or more face captures under one profile ID."""
     if not name:
         return False, "Provide a name or identifier."
-
-    crop, message = prepare_single_face_crop(uploaded_file)
-    if crop is None:
-        return False, message
 
     prefix = "Victim" if "Victim" in role_label or "Lost" in role_label else "Staff"
     safe_name = "".join(
@@ -981,12 +1353,53 @@ def save_registered_profile(
     if not safe_name:
         return False, "Provide a valid name or identifier."
 
-    destination = REG_DIR / f"{prefix}_{safe_name}.jpg"
-    cv2.imwrite(str(destination), crop)
+    required_angles = ENROLLMENT_ANGLES if require_all_angles else ("front",)
+    missing_angles = [angle for angle in required_angles if angle not in captures]
+    if missing_angles:
+        return False, "Capture all required angles: " + ", ".join(missing_angles)
 
+    profile_id = f"{prefix}_{safe_name}"
+    crops: dict[str, np.ndarray] = {}
+    for angle in required_angles:
+        capture = captures.get(angle)
+        if isinstance(capture, (bytes, bytearray)):
+            capture = BytesIO(capture)
+        crop, message = prepare_single_face_crop(capture)
+        if crop is None:
+            return False, f"{angle.title()} capture invalid: {message}"
+        crops[angle] = crop
+
+    # Replace only this profile's old angle files, if the administrator is
+    # updating an existing profile.
+    for old_path in REG_DIR.glob(f"{profile_id}__*.*"):
+        if old_path.is_file():
+            old_path.unlink()
+    legacy_path = REG_DIR / f"{profile_id}.jpg"
+    if legacy_path.exists():
+        legacy_path.unlink()
+
+    for angle, crop in crops.items():
+        destination = REG_DIR / f"{profile_id}__{angle}.jpg"
+        cv2.imwrite(str(destination), crop)
+
+    model_name, detector_backend, _ = get_runtime_face_settings()
     load_known_face_encodings.clear()
-    load_known_face_encodings()
-    return True, message
+    load_known_face_encodings(model_name, detector_backend)
+    return True, f"Saved {len(crops)} angle captures for {name}."
+
+
+def save_registered_profile(
+    name: str, role_label: str, uploaded_file
+) -> tuple[bool, str]:
+    """Backward-compatible single-photo profile save."""
+    if uploaded_file is None:
+        return False, "Choose an image or capture a photo first."
+    return save_registered_profile_captures(
+        name,
+        role_label,
+        {"front": uploaded_file},
+        require_all_angles=False,
+    )
 
 
 def clear_audit_log() -> None:
@@ -1072,17 +1485,71 @@ def render_sidebar() -> None:
         st.sidebar.header("Administrator controls")
         photo_source = st.sidebar.radio(
             "Profile photo source",
-            ["Upload image", "Camera capture"],
+            ["Guided multi-angle camera", "Upload single image"],
             horizontal=True,
             key="registration_photo_source",
         )
-        if photo_source == "Camera capture":
-            uploaded_photo = st.sidebar.camera_input(
-                "Capture one face",
-                key="registration_camera",
-                help="Keep one person centered, facing the camera, with good lighting.",
-                resolution="720p",
+        uploaded_photo = None
+        enrollment_captures = st.session_state.setdefault(
+            "enrollment_captures", {}
+        )
+
+        if photo_source == "Guided multi-angle camera":
+            current_angle = next(
+                (
+                    angle
+                    for angle in ENROLLMENT_ANGLES
+                    if angle not in enrollment_captures
+                ),
+                None,
             )
+            completed_count = len(enrollment_captures)
+            st.sidebar.progress(
+                completed_count / len(ENROLLMENT_ANGLES),
+                text=f"Angle captures: {completed_count}/{len(ENROLLMENT_ANGLES)}",
+            )
+            if current_angle:
+                st.sidebar.info(
+                    f"Step {completed_count + 1}/{len(ENROLLMENT_ANGLES)} — "
+                    f"{ENROLLMENT_INSTRUCTIONS[current_angle]}"
+                )
+                angle_capture = st.sidebar.camera_input(
+                    f"Capture {current_angle.title()} angle",
+                    key=f"registration_camera_{current_angle}",
+                    help="Keep one person centered and ensure the face is clearly visible.",
+                    resolution="720p",
+                )
+                if angle_capture is not None and current_angle not in enrollment_captures:
+                    prepared_crop, crop_message = prepare_single_face_crop(angle_capture)
+                    if prepared_crop is None:
+                        st.sidebar.warning(crop_message)
+                    else:
+                        enrollment_captures[current_angle] = angle_capture.getvalue()
+                        st.sidebar.success(
+                            f"{current_angle.title()} angle accepted. Next angle is ready."
+                        )
+                        st.rerun()
+
+            if enrollment_captures:
+                st.sidebar.caption("Captured angles")
+                preview_columns = st.sidebar.columns(len(enrollment_captures))
+                for preview_column, angle in zip(
+                    preview_columns, ENROLLMENT_ANGLES
+                ):
+                    if angle in enrollment_captures:
+                        crop, _ = prepare_single_face_crop(
+                            BytesIO(enrollment_captures[angle])
+                        )
+                        if crop is not None:
+                            preview_column.image(
+                                cv2.cvtColor(crop, cv2.COLOR_BGR2RGB),
+                                caption=angle.title(),
+                                width="content",
+                            )
+
+                if st.sidebar.button("Clear angle captures", key="clear_enrollment_captures"):
+                    enrollment_captures.clear()
+                    st.rerun()
         else:
             uploaded_photo = st.sidebar.file_uploader(
                 "Upload face image", type=["jpg", "jpeg", "png"], key="registration_upload"
@@ -1107,14 +1574,32 @@ def render_sidebar() -> None:
                 "Classification Role",
                 ["Staff", "Victim"],
             )
-            submitted = st.form_submit_button("Save Profile")
+            can_save = (
+                photo_source == "Upload single image"
+                or all(angle in enrollment_captures for angle in ENROLLMENT_ANGLES)
+            )
+            submitted = st.form_submit_button(
+                "Save multi-angle profile"
+                if photo_source == "Guided multi-angle camera"
+                else "Save Profile",
+                disabled=not can_save,
+            )
             if submitted:
-                saved, save_message = save_registered_profile(
-                    reg_name, reg_role, uploaded_photo
-                )
+                if photo_source == "Guided multi-angle camera":
+                    saved, save_message = save_registered_profile_captures(
+                        reg_name,
+                        reg_role,
+                        enrollment_captures,
+                        require_all_angles=True,
+                    )
+                else:
+                    saved, save_message = save_registered_profile(
+                        reg_name, reg_role, uploaded_photo
+                    )
                 if saved:
                     st.sidebar.success(f"Registered profile for {reg_name}")
                     st.session_state.last_status = "Profile saved"
+                    enrollment_captures.clear()
                 else:
                     st.sidebar.error(save_message)
 
@@ -1251,9 +1736,6 @@ def render_main_ui() -> None:
     col_m3.metric("Unknown Faces", get_unknown_face_count())
     col_m4.metric("Total Log Events", len(log_df))
 
-    render_face_inventory_panel(registered_df)
-    render_face_photo_gallery(registered_df)
-
     button_label = "Stop Surveillance" if st.session_state.streaming else "Start Surveillance"
     if st.button(button_label, width='stretch', type="primary" if not st.session_state.streaming else "secondary"):
         if not st.session_state.streaming and video_target is None:
@@ -1269,6 +1751,11 @@ def render_main_ui() -> None:
     match_area = st.empty()
     render_detection_result(match_area)
     frame_placeholder = st.empty()
+
+    # Keep the live controls and result panel above the secondary profile
+    # inventory/photo sections so operators see the mission state first.
+    render_face_inventory_panel(registered_df)
+    render_face_photo_gallery(registered_df)
 
     if st.session_state.streaming and video_target is not None:
         cap = cv2.VideoCapture(video_target)
@@ -1409,6 +1896,22 @@ def render_face_photo_gallery(registered_df: pd.DataFrame | None = None) -> None
                 )
             else:
                 st.warning("Photo file is not available at the stored path.")
+
+            if gallery_category in {"Registered", "Victim"}:
+                angle_paths = get_profile_angle_paths(
+                    str(selected_record["profile_id"])
+                )
+                if len(angle_paths) > 1:
+                    st.caption("Saved profile angles")
+                    angle_columns = st.columns(len(angle_paths))
+                    for angle_column, (angle, angle_path) in zip(
+                        angle_columns, sorted(angle_paths.items())
+                    ):
+                        angle_column.image(
+                            str(angle_path),
+                            caption=angle.title(),
+                            width="content",
+                        )
 
         with details_col:
             if gallery_category in {"Registered", "Victim"}:
@@ -1571,7 +2074,8 @@ def main() -> None:
     render_sidebar()
     
     if st.session_state.authenticated:
-        load_known_face_encodings()
+        model_name, detector_backend, _ = get_runtime_face_settings()
+        load_known_face_encodings(model_name, detector_backend)
         render_main_ui()
         render_facial_analytics_panel()
         render_log_viewer()
