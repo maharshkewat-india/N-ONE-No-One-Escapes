@@ -45,7 +45,7 @@ This report covers the current issues identified in `app.py` and the fixes appli
 - Unknown faces continue to populate the unknown store without appearing as Victim matches.
 - Windows `WinError 10054` is documented as a browser/Streamlit connection reset during live streaming.
 
-## Current behavior and troubleshooting (2026-08-09)
+## Current behavior and troubleshooting (2026-08-13)
 
 ### Victim search behavior
 
@@ -55,9 +55,16 @@ This report covers the current issues identified in `app.py` and the fixes appli
 - The operator-provided camera location is stored with unknown events and Victim sightings.
 - Successful Victim matches appear with the name, current location, and latest sighting for each previously recorded location.
 
+### Model and camera selection
+
+- For Victim Search and Attendance Logger, use `Facenet512` + `retinaface` + `cosine` with a starting distance threshold of `0.30–0.40` after confirming that TensorFlow/DeepFace loaded.
+- If the runtime reports `OpenCVFaceBackend`, the app is using the frontal/profile Haar detector and HOG/CLAHE fallback features. Sidebar model changes are not neural-model changes in this state.
+- Use `Browser Webcam (WebRTC)` for a browser or remote camera. Use `Laptop Webcam` only when the camera is attached to the machine running Streamlit. Recorded files and IP streams use OpenCV.
+- Victim Search renders only the selected Victim and shows a separate Victim Found card. Attendance shows known identities and unknown IDs/details. Threat Detection is contour/heuristic processing and does not use face settings.
+
 ### Windows `ConnectionResetError: [WinError 10054]`
 
-This traceback comes from Python's asyncio/Proactor network layer when the browser closes or resets the Streamlit WebSocket. It is commonly triggered by refreshing/closing the browser during the synchronous OpenCV streaming loop, stopping a feed, or losing an IP-camera connection. It is not evidence that face matching failed. Stop the feed before refreshing; if the dashboard disconnects repeatedly, the streaming loop should be migrated to a non-blocking Streamlit fragment or dedicated video component.
+This traceback comes from Python's asyncio/Proactor network layer when the browser closes or resets the Streamlit WebSocket. It can happen while stopping WebRTC/OpenCV streaming, refreshing/closing the browser, or losing an IP-camera connection. It is not evidence that face matching failed. Stop the feed before refreshing; if a local camera is black or unavailable, allow browser permission and switch to WebRTC.
 
 ### Validation
 

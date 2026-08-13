@@ -1,13 +1,15 @@
 # PROJECT SYNOPSIS: N-ONE (no one escapes)
 
+> **Current implementation note (2026-08-13):** DeepFace is used when TensorFlow is available; otherwise the application reports `OpenCVFaceBackend` and uses frontal/profile detection with HOG/CLAHE fallback features. `Browser Webcam (WebRTC)` is the recommended live source.
+
 ## 1. INTRODUCTION
-N-ONE is an Advanced Multi-Mode AI Surveillance & Threat Tracking Platform designed for modern security and monitoring challenges. Leveraging cutting-edge AI-driven computer vision, N-ONE offers a robust solution for diverse applications, including lost person tracking, perimeter security, and threat detection. The platform integrates real-time video stream analysis with sophisticated facial recognition and weapon detection capabilities. Built on a Python 3.10+ ecosystem, N-ONE utilizes Streamlit for an intuitive, dark-themed UI dashboard, OpenCV for core image processing, and the DeepFace framework (with Facenet/ArcFace backends) for high-accuracy facial embedding extraction. Data logging and analysis are managed via Pandas, while PIL handles image manipulation, and RTSP/TCP Stream decoders ensure versatile video feed ingestion. This comprehensive system is engineered to provide proactive monitoring, rapid identification, and structured audit trails, significantly enhancing situational awareness and response capabilities in various operational environments.
+N-ONE is an Advanced Multi-Mode AI Surveillance & Threat Tracking Platform designed for modern security and monitoring challenges. Leveraging AI-driven computer vision, N-ONE offers a robust solution for lost person tracking, perimeter security, and threat detection. The platform integrates real-time video analysis with facial recognition and weapon detection capabilities. Built on Python 3.10+, N-ONE uses Streamlit for the dashboard, OpenCV for core image processing, and DeepFace models such as Facenet512/ArcFace when the full TensorFlow runtime is available, with an OpenCV fallback. Data logging and analysis are managed via Pandas, while PIL handles image manipulation and WebRTC/OpenCV support versatile camera and video ingestion.
 
 ## 2. ADVANTAGES OF THE PROPOSED SYSTEM & LIMITATIONS
 
 ### Advantages:
 *   **Multi-Modal Surveillance:** Seamless integration of lost person tracking, member attendance logging, and threat detection within a single, unified platform.
-*   **High-Accuracy Facial Recognition:** Utilizes DeepFace with robust backends (Facenet/ArcFace) to ensure high precision in identifying individuals, minimizing false positives and negatives.
+*   **Facial Recognition:** Uses DeepFace models such as Facenet512/ArcFace when the full runtime is available, with an OpenCV fallback for lightweight environments.
 *   **Dynamic Video Ingestion:** Supports diverse video sources including laptop webcams, pre-recorded files, and IP camera RTSP/TCP streams, offering deployment flexibility.
 *   **Intuitive User Interface:** A modern dark UI dashboard built with Streamlit provides an accessible and efficient operational experience for both administrators and operators.
 *   **Role-Based Access Control (RBAC):** Ensures secure operation with distinct access levels for Admin and Operator roles, enhancing system integrity and data protection.
@@ -29,7 +31,7 @@ Current surveillance systems often lack the integration and intelligence require
 The primary objectives of the N-ONE platform are:
 *   To design and implement a multi-mode AI surveillance system capable of dynamically switching between lost person tracking, member attendance logging, and threat detection functionalities.
 *   To develop a secure Role-Based Access Control (RBAC) gateway to differentiate between administrative and operational privileges, ensuring system integrity and data security.
-*   To integrate high-accuracy facial recognition capabilities using the DeepFace framework (Facenet/ArcFace backends) for reliable subject identification and embedding extraction.
+*   To integrate configurable facial recognition using DeepFace (Facenet512/ArcFace when available) and a clearly reported OpenCV fallback.
 *   To enable versatile video feed ingestion from various sources, including laptop webcams, recorded video files, and real-time IP camera RTSP/TCP streams.
 *   To construct a Subject Profile Registration Engine for secure enrollment and management of target individuals (lost persons) and authorized personnel.
 *   To implement a system for tracking and re-identifying unknown individuals, complete with a persistent database and sighting logs.
@@ -196,7 +198,7 @@ The project's reliance on established libraries mitigates significant software d
 8.  **Streamlit Documentation.** Retrieved from `https://docs.streamlit.io/` [Modern UI/Dashboard Development]
 9.  **Pandas Development Team. (Current Year).** *pandas: powerful Python data analysis and manipulation library*. Retrieved from `https://pandas.pydata.org/` [Data Analysis & Logging]
 
-## 9. Current implementation update (2026-08-09)
+## 9. Current implementation update (2026-08-13)
 
 The current application extends the original synopsis with the following operational behavior:
 
@@ -208,4 +210,16 @@ The current application extends the original synopsis with the following operati
 - Other faces are silently stored or re-identified as unknowns. Their IDs are not drawn on the Victim-search screen.
 - The operator supplies a camera location. A successful Victim match displays the Victim name, current location, and the latest sighting for each previously recorded location.
 - Victim sightings are stored in `detection_logs/victim_sighting_log.csv`; unknown data remains in `unknown_person_db.csv` and `unknown_sighting_log.csv`.
-- A browser/network disconnect during the synchronous live loop can produce Windows `WinError 10054`. This is a closed Streamlit client connection, not an identity-match result.
+- `Browser Webcam (WebRTC)` is the recommended live source for browser/remote cameras; local webcam, recorded files, and IP streams use OpenCV.
+- A separate `VICTIM FOUND` card shows the selected Victim image, profile ID, location, distance, timestamp, active configuration, and sighting history.
+- A browser/network disconnect during WebRTC or OpenCV streaming can produce Windows `WinError 10054`. This is a closed Streamlit client connection, not an identity-match result.
+
+## 10. Operator and model instructions (2026-08-13)
+
+| Mode | Use it for | Recommended full DeepFace settings | What the operator sees |
+|---|---|---|---|
+| Lost Person Search / Victim Search | Finding one registered missing person | `Facenet512` + `retinaface` + `cosine`, threshold `0.30–0.40` to start | Only the selected Victim; non-target faces are silent. |
+| Member Attendance Logger | Attendance for all registered people | Same settings for accuracy, or `Facenet` for faster CPU use | Known Staff/Victim labels plus visible unknown IDs/details. |
+| Threat & Weapon Detection | Heuristic threat/weapon alerts | Face model settings are not used | Threat result; human review required. |
+
+If the app reports `OpenCVFaceBackend`, TensorFlow is unavailable and the app is using frontal/profile Haar detection with HOG/CLAHE fallback features. Sidebar model changes do not activate neural inference until the full DeepFace runtime is installed. For live browser cameras, start surveillance, allow permission, then press `START` in the WebRTC panel.

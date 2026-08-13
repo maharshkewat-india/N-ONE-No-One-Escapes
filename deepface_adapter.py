@@ -20,6 +20,7 @@ class OpenCVFaceBackend:
     def __init__(self, error_message: str | None = None) -> None:
         self.error_message = error_message or "OpenCV fallback mode active."
         self.face_cascade = None
+        self.profile_cascade = None
         self.recognizer = None
         self._init_opencv()
 
@@ -38,6 +39,17 @@ class OpenCVFaceBackend:
             self.face_cascade = None
             self.error_message = f"OpenCV face-detector initialization error: {exc}"
 
+        # A frontal-only cascade misses people who are looking sideways.  The
+        # profile cascade is optional, so keep the frontal detector usable if
+        # this file is not present in a minimal OpenCV installation.
+        try:
+            profile_path = cv2.data.haarcascades + "haarcascade_profileface.xml"
+            self.profile_cascade = cv2.CascadeClassifier(profile_path)
+            if self.profile_cascade.empty():
+                self.profile_cascade = None
+        except Exception:
+            self.profile_cascade = None
+
         try:
             # Optional: not required by this adapter's embedding pipeline.
             self.recognizer = cv2.face.LBPHFaceRecognizer_create()
@@ -45,25 +57,79 @@ class OpenCVFaceBackend:
             self.recognizer = None
 
     def detect_faces(self, img: np.ndarray) -> List[Dict]:
-        """Detect faces using OpenCV Haar cascades."""
+        """Detect frontal and profile faces using OpenCV Haar cascades.
+
+        The fallback is used when the full DeepFace runtime is unavailable.
+        Running on an equalized image, checking both profile directions, and
+        retrying an upscaled frame helps with dim footage and small faces while
+        keeping the returned coordinates in the original frame's space.
+        """
         if self.face_cascade is None:
             return []
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-        faces = self.face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(30, 30)
+        gray = cv2.equalizeHist(gray)
+
+        def detect_with_cascade(
+            cascade: Any | None,
+            image: np.ndarray,
+            coordinate_scale: float = 1.0,
+            mirrored: bool = False,
+        ) -> List[Dict]:
+            if cascade is None:
+                return []
+            detected = cascade.detectMultiScale(
+                image,
+                scaleFactor=1.08,
+                minNeighbors=4,
+                minSize=(24, 24),
+            )
+            image_width = image.shape[1]
+            results = []
+            for x, y, w, h in detected:
+                if mirrored:
+                    x = image_width - x - w
+                results.append(
+                    {
+                        "facial_area": {
+                            "x": max(0, int(x / coordinate_scale)),
+                            "y": max(0, int(y / coordinate_scale)),
+                            "w": max(1, int(w / coordinate_scale)),
+                            "h": max(1, int(h / coordinate_scale)),
+                        },
+                        "confidence": 1.0,
+                    }
+                )
+            return results
+
+        results = detect_with_cascade(self.face_cascade, gray)
+        results.extend(detect_with_cascade(self.profile_cascade, gray))
+        # The profile cascade is left-facing.  Mirror the image to detect the
+        # opposite profile, then mirror the coordinates back.
+        results.extend(
+            detect_with_cascade(
+                self.profile_cascade,
+                cv2.flip(gray, 1),
+                mirrored=True,
+            )
         )
 
-        # Convert to expected format: list of dicts with facial_area and confidence
-        results = []
-        for (x, y, w, h) in faces:
-            results.append({
-                'facial_area': {'x': x, 'y': y, 'w': w, 'h': h},
-                'confidence': 1.0  # OpenCV doesn't provide confidence, use 1.0
-            })
+        # If the first pass found nothing, enlarge the frame so faces smaller
+        # than the cascade's native minimum size still get a chance.
+        if not results and min(gray.shape[:2]) < 900:
+            scale = 1.5
+            enlarged = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            results.extend(detect_with_cascade(self.face_cascade, enlarged, scale))
+            results.extend(detect_with_cascade(self.profile_cascade, enlarged, scale))
+            results.extend(
+                detect_with_cascade(
+                    self.profile_cascade,
+                    cv2.flip(enlarged, 1),
+                    scale,
+                    mirrored=True,
+                )
+            )
+
         return self._deduplicate_faces(results)
 
     @staticmethod
@@ -93,32 +159,36 @@ class OpenCVFaceBackend:
         return kept
 
     def extract_embedding(self, face_roi: np.ndarray) -> Optional[np.ndarray]:
-        """Extract a simple feature vector from face ROI using histogram comparison."""
+        """Extract a lighting-tolerant fallback feature vector from a face ROI.
+
+        This is not a replacement for a learned face-recognition model, but a
+        HOG descriptor is substantially more stable than comparing raw gray
+        pixels when the same person changes lighting, scale, or expression.
+        """
         try:
-            # Convert to grayscale if needed
             if len(face_roi.shape) == 3:
                 gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
             else:
                 gray = face_roi
 
-            # Resize and equalize the face so the fallback has some spatial
-            # identity information instead of relying only on a global histogram.
-            resized = cv2.resize(gray, (64, 64))
-            normalized = cv2.equalizeHist(resized).astype(np.float32) / 255.0
-            spatial = normalized.flatten()
-            spatial = spatial - spatial.mean()
-            spatial /= np.linalg.norm(spatial) + 1e-8
+            resized = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
+            normalized = cv2.createCLAHE(
+                clipLimit=2.0,
+                tileGridSize=(8, 8),
+            ).apply(resized)
 
-            # Add coarse gradient structure for edges such as eyes, nose, and jaw.
-            gradient_x = cv2.Sobel(normalized, cv2.CV_32F, 1, 0, ksize=3)
-            gradient_y = cv2.Sobel(normalized, cv2.CV_32F, 0, 1, ksize=3)
-            gradient = cv2.magnitude(gradient_x, gradient_y).flatten()
-            gradient /= np.linalg.norm(gradient) + 1e-8
-
-            # Combine features. This is only a dependency-free fallback; the
-            # real DeepFace backend remains preferred for production accuracy.
-            embedding = np.concatenate([spatial, gradient])
-            return embedding.astype(np.float64)
+            # HOG captures stable facial structure (eye sockets, nose, mouth,
+            # and jaw edges) while reducing sensitivity to brightness changes.
+            descriptor = cv2.HOGDescriptor(
+                _winSize=(64, 64),
+                _blockSize=(16, 16),
+                _blockStride=(8, 8),
+                _cellSize=(8, 8),
+                _nbins=9,
+            )
+            embedding = descriptor.compute(normalized).reshape(-1).astype(np.float64)
+            embedding /= np.linalg.norm(embedding) + 1e-8
+            return embedding
 
         except Exception as e:
             print(f"Embedding extraction error: {e}")

@@ -2,7 +2,9 @@
 
 ## Overview
 
-This document describes the AI model architecture, configuration, and operational workflow for the N-ONE surveillance platform. The system uses **DeepFace** as the primary recognition engine with an **OpenCV fallback** for environments where the full DeepFace package is unavailable.
+This document describes the AI model architecture, configuration, and operational workflow for the N-ONE surveillance platform. The system uses **DeepFace** when its TensorFlow runtime is available and an **OpenCV fallback** when it is not. The application always exposes the same settings, but the selected neural model/backend is only active when the real DeepFace runtime loads successfully.
+
+> **Current runtime note (2026-08-13):** The development environment currently falls back to `OpenCVFaceBackend` because TensorFlow is unavailable. In this mode, changing the model name in the sidebar does not download or activate a neural model. Install/verify TensorFlow and restart the app before evaluating Facenet512, RetinaFace, ArcFace, or another DeepFace model.
 
 ---
 
@@ -309,12 +311,12 @@ def configure_session_state() -> None:
 
 ## 6. OpenCV Fallback Implementation
 
-When the real DeepFace package is unavailable, the system falls back to **OpenCV** with the following characteristics:
+When the real DeepFace runtime is unavailable, the system falls back to **OpenCV** with the following characteristics:
 
 | Feature | OpenCV Backend | DeepFace Backend |
 |---------|---------------|------------------|
 | **Detection** | Haar cascade + LBPH | mtcnn / retinaface / dlib |
-| **Embedding** | Histogram + LBP features | CNN vector embeddings |
+| **Embedding** | HOG descriptor with CLAHE-normalized face crop | CNN vector embeddings |
 | **Similarity** | Euclidean (L2) | Cosine / Euclidean / L2 |
 | **Speed** | Fast (CPU only) | Moderate (GPU acceleration) |
 | **Accuracy** | Lower | Higher |
@@ -324,11 +326,11 @@ When the real DeepFace package is unavailable, the system falls back to **OpenCV
 
 The `OpenCVFaceBackend` class in `deepface_adapter.py` implements:
 
-- **`represent()`**: Extracts face embeddings using histogram/LBP features
+- **`represent()`**: Extracts fallback face embeddings using HOG/CLAHE features
 - **`find()`**: Searches database using distance metrics (cosine, euclidean, euclidean_l2)
 - **`verify()`**: Compares two faces using configurable distance metric
-- **`detect_faces()`**: Uses Haar cascade for face detection
-- **`extract_embedding()`**: Computes histogram + LBP feature vectors
+- **`detect_faces()`**: Uses frontal/profile Haar cascades with an equalized/upscaled retry
+- **`extract_embedding()`**: Computes a HOG descriptor from a CLAHE-normalized face crop
 
 ---
 
@@ -507,9 +509,37 @@ pytest tests/ -v
 
 ---
 
-*Last updated: 2026-08-09 | Version: 1.1.0*
+*Last updated: 2026-08-13 | Version: 1.1.0*
 
-## 14. Current target-search behavior (2026-08-09)
+## 14. Current operating instructions (2026-08-13)
+
+### Mode-to-model matrix
+
+| Dashboard mode | What it compares/detects | Recommended full DeepFace configuration | Result behavior |
+|---|---|---|---|
+| **Lost Person Search / Victim Search** | One selected `Victim` profile only, using all saved enrollment angles | `Facenet512` + `retinaface` + `cosine`; start threshold `0.30–0.40`, then calibrate | Only the selected Victim can be visible. A match is labelled `VICTIM FOUND`, logged with location, and shown in the dedicated Victim Found card/history. |
+| **Member Attendance Logger** | All registered `Staff` and `Victim` profiles, then unknown re-identification | `Facenet512` + `retinaface` + `cosine`; use `Facenet` for a faster CPU-oriented option | Known identities are labelled. Non-matches are saved/re-identified as unknowns and remain visible with their unknown ID/details. |
+| **Threat & Weapon Detection** | Contour/heuristic threat logic, not face identity | Face model settings do not control this mode | Review threat alerts manually; do not select a Victim target for this mode. |
+
+For the current OpenCV fallback, use a clear frontal enrollment image and treat matches as assistance only: HOG/CLAHE is more tolerant than raw pixels, but it is not equivalent to a learned identity model.
+
+### Victim Search operator steps
+
+1. Register the person as category `Victim` with one face per image; five angles (`front`, `left`, `right`, `up`, `down`) are recommended.
+2. Select `Lost Person Search`, choose the exact Victim profile, enter the camera location, and select a video source.
+3. Prefer `Browser Webcam (WebRTC)` for a browser/remote camera. Allow permission and press `START` in the WebRTC panel after starting surveillance.
+4. For a local Windows camera, `Laptop Webcam` uses OpenCV and probes common camera backends. If it is black or unavailable, use WebRTC.
+5. When found, verify the image, profile ID, location, distance, timestamp, and model/backend shown in the separate `VICTIM FOUND` card. Victim history is stored in `detection_logs/victim_sighting_log.csv`.
+
+### Attendance Logger operator steps
+
+Select `Member Attendance Logger`, set the camera location, and use the same recommended DeepFace settings. Confirm that TensorFlow is loaded before relying on the neural model. Run a short calibration clip containing known staff and unrelated faces; lower the distance threshold for stricter matching and raise it only when genuine matches are being missed. Unknown data is stored in `unknown_faces/`, `unknown_person_db.csv`, and `unknown_sighting_log.csv`.
+
+### Video input rules
+
+`Browser Webcam (WebRTC)` is the recommended live source because the browser supplies camera frames directly and it works when Streamlit is remote or cloud-hosted. `Laptop Webcam` and recorded/IP-camera sources use server-side OpenCV. WebRTC requires `streamlit-webrtc==0.77.0` and a browser secure context (localhost or HTTPS). A browser refresh/close can still produce Windows `WinError 10054`; it is a client connection reset, not a face-match result.
+
+## 15. Current target-search behavior (2026-08-13)
 
 Model configuration is shared by normal recognition and Victim search, but the candidate set changes in `1. Lost Person Search`:
 
@@ -521,8 +551,9 @@ Model configuration is shared by normal recognition and Victim search, but the c
 
 The current camera location is passed to both unknown sighting updates and Victim sighting records. Victim history is stored at `detection_logs/victim_sighting_log.csv` and is displayed in the result panel and log viewer.
 
-The application test command is:
+The application validation commands are:
 
 ```powershell
 python -m pytest tests -q
+python -m py_compile app.py deepface_adapter.py
 ```

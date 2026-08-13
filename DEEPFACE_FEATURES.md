@@ -1,7 +1,9 @@
 # DeepFace Integrated Features - N-ONE Surveillance Platform
 
 ## Overview
-The N-ONE Surveillance Platform has been enhanced with comprehensive DeepFace features for advanced facial recognition, analysis, and verification capabilities.
+The N-ONE Surveillance Platform integrates DeepFace for neural face recognition when the TensorFlow runtime is available. It keeps an OpenCV fallback so the dashboard and camera workflows remain usable in lightweight environments.
+
+> **Runtime truth (2026-08-13):** The current development environment may report `OpenCVFaceBackend` when TensorFlow is missing. In fallback mode, the sidebar model/backend names are configuration values only; the neural model is not active until TensorFlow and DeepFace dependencies load successfully.
 
 ---
 
@@ -17,7 +19,7 @@ Multiple pre-trained models for facial recognition:
 - **ArcFace** - Additive Angular Margin Loss
 - **SFace** - Softmax loss-based model
 
-**Configuration**: Select model from sidebar settings under "🔧 DeepFace Settings"
+**Configuration**: Select the model from `DeepFace Settings`. For Victim Search and Attendance Logger, the recommended full-runtime choice is `Facenet512` + `retinaface` + `cosine`; start with threshold `0.30–0.40` and calibrate on representative footage.
 
 ---
 
@@ -34,7 +36,7 @@ Multiple detection methods for robustness:
 - **FastMTCNN** - Optimized MTCNN
 - **CenterFace** - Efficient centroid-based detection
 
-**Configuration**: Select backend from sidebar settings under "🔧 DeepFace Settings"
+**Configuration**: Select the backend from `DeepFace Settings`. `retinaface` is the accuracy-oriented recommendation for a full DeepFace runtime; `opencv` is the lightweight option.
 
 ---
 
@@ -383,11 +385,11 @@ For more information:
 
 ---
 
-**Last Updated**: 2026-08-09
+**Last Updated**: 2026-08-13
 **Platform Version**: N-ONE v1.1  
 **DeepFace Version**: 0.0.100
 
-## Current N-ONE workflow update (2026-08-09)
+## Current N-ONE workflow update (2026-08-13)
 
 ### Registered profile categories
 
@@ -413,3 +415,10 @@ Authenticated users can open the read-only photo viewer and choose `Registered`,
 python -m pytest tests -q
 python -m py_compile app.py deepface_adapter.py
 ```
+
+### Mode-specific instructions
+
+- **Victim Search:** choose one `Victim`; compare only against that profile and verify the separate `VICTIM FOUND` card. Recommended full runtime: `Facenet512` + `retinaface` + `cosine`, threshold `0.30–0.40` to start.
+- **Member Attendance Logger:** compare against all registered `Staff` and `Victim` profiles. Keep unknown IDs/details visible for attendance review and re-identification. Use the same model recommendation, or `Facenet` for faster CPU processing.
+- **Threat Detection:** uses contour/heuristic threat processing; facial model/backend settings do not change this mode.
+- **Live camera:** use `Browser Webcam (WebRTC)` for browser/remote cameras. Use server-side OpenCV only for a camera attached to the Streamlit host, or for recorded/IP sources.

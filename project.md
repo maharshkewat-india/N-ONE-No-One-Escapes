@@ -22,7 +22,7 @@ The platform integrates real-time video stream analysis with sophisticated facia
 - **Structured Audit & Logging:** All significant events are logged to CSV files with timestamps, available for download and analysis through the UI.
 - **Intuitive User Interface:** A modern, dark-themed dashboard built with Streamlit provides real-time video feeds, system controls, and data visualization.
 
-## 8. Current implementation notes (2026-08-09)
+## 8. Current implementation notes (2026-08-13)
 
 - The dashboard is shared by Administrators and Operators and shows registered-face and unknown-face counts.
 - Registered profiles are classified as `Staff` or `Victim`; legacy `Member_` and `Lost_` filename prefixes remain supported.
@@ -30,7 +30,9 @@ The platform integrates real-time video stream analysis with sophisticated facia
 - The dashboard photo viewer supports `Registered`, `Victim`, and `Unknown` selections and displays the stored face image with profile/sighting details.
 - Lost Person Search uses a selected Victim target only. Unknown faces continue to be saved/re-identified silently while the target is being searched.
 - Victim matches show the name, current camera location, and the latest sighting per known location. These records are written to `detection_logs/victim_sighting_log.csv`.
-- For the complete test suite used by this project, run `python -m pytest tests -q`.
+- Browser Webcam uses WebRTC and is the recommended live source; local webcam, files, and IP streams use OpenCV. A separate Victim Found result card shows the saved image, profile ID, distance, timestamp, active configuration, and history.
+- The full DeepFace recommendation for Victim Search and Attendance Logger is `Facenet512` + `retinaface` + `cosine`, threshold `0.30–0.40` to start. If TensorFlow is missing, `OpenCVFaceBackend` uses frontal/profile detection plus HOG/CLAHE fallback features and sidebar model names are not active neural models.
+- For the complete application test suite used by this project, run `python -m pytest tests -q` when pytest is installed; always run `python -m py_compile app.py deepface_adapter.py`.
 
 ## 3. System Architecture
 
@@ -38,8 +40,8 @@ N-ONE uses a modular, three-layered architecture:
 
 1.  **Streamlit UI Layer:** Handles user interaction, including RBAC authentication, camera controls, face-only profile registration, mode selection, and live match-result feedback.
 2.  **Processing Layer:** The core of the system, responsible for:
-    - Capturing frames via **OpenCV**.
-    - Performing facial recognition and matching using **DeepFace**.
+    - Capturing browser frames via **WebRTC** or local/file/IP frames via **OpenCV**.
+    - Performing facial recognition using **DeepFace** when TensorFlow is available, with an **OpenCV/HOG fallback** otherwise.
     - Running weapon detection heuristics.
     - Annotating video frames with status updates.
 3.  **Storage Layer:** Manages all persistent data on the file system:

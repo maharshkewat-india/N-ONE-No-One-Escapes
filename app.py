@@ -1,5 +1,6 @@
 import hmac
 import os
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
@@ -11,6 +12,15 @@ import streamlit as st
 from PIL import Image
 from scipy.spatial.distance import cosine
 from streamlit.errors import StreamlitSecretNotFoundError
+
+try:
+    import av
+    from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
+except ImportError:  # Keep the dashboard usable until optional WebRTC deps are installed.
+    av = None
+    VideoProcessorBase = None
+    WebRtcMode = None
+    webrtc_streamer = None
 
 from deepface_adapter import DEEPFACE_IMPORT_ERROR, DeepFace
 
@@ -125,7 +135,10 @@ UNKNOWN_SIGHTING_LAST_WRITE: dict[tuple[str, str], float] = {}
 UNKNOWN_SIGHTING_MEMORY: dict[str, dict[str, str]] = {}
 THREAT_LOG_INTERVAL_SECONDS = 2.0
 LAST_THREAT_LOG_TIME = 0.0
-PROCESSING_MAX_WIDTH = 960
+# Keep more detail for small/distant faces in recorded footage.  The fallback
+# detector can now handle profile faces and will retry a small frame at a
+# higher scale when necessary.
+PROCESSING_MAX_WIDTH = 1280
 
 
 def invalidate_unknown_face_cache() -> None:
@@ -637,6 +650,9 @@ def record_detection_result(
     previous_timestamp: str = "",
     previous_location: str = "",
     profile_id: str = "",
+    model_name: str = "",
+    detector_backend: str = "",
+    metric: str = "",
 ) -> None:
     """Store the latest recognition event for the live status panel."""
     st.session_state.last_detection = {
@@ -650,6 +666,9 @@ def record_detection_result(
         "previous_timestamp": previous_timestamp,
         "previous_location": previous_location,
         "profile_id": profile_id,
+        "model_name": model_name,
+        "detector_backend": detector_backend,
+        "metric": metric,
     }
 
 
@@ -1044,8 +1063,12 @@ def process_frame(
                     subject=name,
                     distance=distance,
                     details="Selected victim matched against the camera feed.",
+                    image_name=Path(known_match.get("image_path", "")).name,
                     location=location,
                     profile_id=known_match["profile_id"],
+                    model_name=model_name,
+                    detector_backend=detector_backend,
+                    metric=metric,
                 )
             else:
                 record_detection_result(
@@ -1087,10 +1110,9 @@ def process_frame(
                     previous_location=previous_sighting.get("location", ""),
                 )
             if victim_search:
-                # Other people are only context while searching; do not expose
-                # an unknown ID in the victim-search feed.
-                color = (0, 255, 0)
-                label = None
+                # Victim search is strict: non-target faces are not annotated
+                # or shown as matches. Only the selected victim gets a box.
+                continue
             elif attendance_mode:
                 color = (0, 0, 255)
                 label = f"Unknown: {unknown_id}"
@@ -1127,8 +1149,8 @@ def process_frame(
                 location=location,
             )
         if victim_search:
-            color = (0, 255, 0)
-            label = None
+            # Do not display non-target faces in the victim-search feed.
+            continue
         elif attendance_mode:
             color = (0, 0, 255)
             label = f"Unknown: {unknown_id}"
@@ -1167,6 +1189,215 @@ def process_frame(
     return annotated_frame, detection_summary
 
 
+def annotate_browser_frame(
+    frame: np.ndarray,
+    mode: str,
+    target_profile_id: str | None,
+    model_name: str,
+    detector_backend: str,
+    metric: str,
+    threshold: float,
+    location: str = "Main Feed",
+    status_sink: dict | None = None,
+) -> np.ndarray:
+    """Annotate a browser-camera frame without touching Streamlit state.
+
+    WebRTC invokes this function on a worker thread, so it deliberately keeps
+    the callback free of widgets, session-state writes, CSV logging, and disk
+    writes. Recognition still uses the same registered-face cache and matcher
+    as the recorded-video path.
+    """
+    processing_frame = frame
+    if frame.shape[1] > PROCESSING_MAX_WIDTH:
+        ratio = PROCESSING_MAX_WIDTH / frame.shape[1]
+        processing_frame = cv2.resize(
+            frame,
+            (PROCESSING_MAX_WIDTH, max(1, int(frame.shape[0] * ratio))),
+            interpolation=cv2.INTER_AREA,
+        )
+    annotated = processing_frame.copy()
+    if status_sink is not None and is_victim_search_mode(mode):
+        status_sink["victim"] = None
+
+    if "Threat" in mode:
+        detected, boxes = check_weapon_contours(annotated)
+        for x, y, w, h, label in boxes:
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            cv2.putText(annotated, label, (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        if not detected:
+            cv2.putText(annotated, "No threat detected", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
+        return annotated
+
+    try:
+        face_objects = DeepFace.represent(
+            img_path=processing_frame,
+            model_name=model_name,
+            detector_backend=detector_backend,
+            enforce_detection=False,
+            align=True,
+            silent=True,
+        )
+    except Exception as exc:
+        cv2.putText(annotated, f"Recognition error: {str(exc)[:70]}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+        return annotated
+
+    for face_object in face_objects or []:
+        area = face_object.get("facial_area", {})
+        x, y = int(area.get("x", 0)), int(area.get("y", 0))
+        w, h = int(area.get("w", 0)), int(area.get("h", 0))
+        if w <= 0 or h <= 0:
+            continue
+        if is_victim_search_mode(mode):
+            match = (
+                find_face_in_known_cache(
+                    face_object.get("embedding", []),
+                    threshold,
+                    profile_id=target_profile_id,
+                    role="Victim",
+                    metric=metric,
+                )
+                if target_profile_id
+                else None
+            )
+        else:
+            match = find_face_in_known_cache(
+                face_object.get("embedding", []), threshold, metric=metric
+            )
+
+        if match:
+            if is_victim_search_mode(mode):
+                label = f"VICTIM FOUND: {match['name']} ({match['distance']:.2f})"
+                color = (0, 0, 255)
+                if status_sink is not None:
+                    status_sink["victim"] = {
+                        "subject": match["name"],
+                        "profile_id": match.get("profile_id", target_profile_id or ""),
+                        "image_name": Path(match.get("image_path", "")).name,
+                        "distance": float(match["distance"]),
+                        "location": location,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "model_name": model_name,
+                        "detector_backend": detector_backend,
+                        "metric": metric,
+                    }
+            else:
+                label = f"MATCH: {match['name']} ({match['distance']:.2f})"
+                color = (0, 200, 0)
+        elif is_victim_search_mode(mode):
+            # In victim-search mode, do not label other people as Unknown.
+            continue
+        else:
+            label = "Unknown"
+            color = (0, 165, 255)
+        cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
+        cv2.putText(annotated, label, (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2)
+
+    if not face_objects:
+        cv2.putText(annotated, "No face detected", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+    return annotated
+
+
+if VideoProcessorBase is not None:
+    class BrowserCameraProcessor(VideoProcessorBase):
+        """WebRTC worker that performs live browser-camera face matching."""
+
+        def __init__(self, mode: str, target_profile_id: str | None, model_name: str, detector_backend: str, metric: str, threshold: float, location: str):
+            self.mode = mode
+            self.target_profile_id = target_profile_id
+            self.model_name = model_name
+            self.detector_backend = detector_backend
+            self.metric = metric
+            self.threshold = threshold
+            self.location = location
+            self._status_lock = threading.Lock()
+            self._latest_victim = None
+
+        def get_latest_victim(self):
+            with self._status_lock:
+                return dict(self._latest_victim) if self._latest_victim else None
+
+        def recv(self, frame):
+            image = frame.to_ndarray(format="bgr24")
+            status_sink = {}
+            annotated = annotate_browser_frame(
+                image,
+                self.mode,
+                self.target_profile_id,
+                self.model_name,
+                self.detector_backend,
+                self.metric,
+                self.threshold,
+                self.location,
+                status_sink,
+            )
+            with self._status_lock:
+                self._latest_victim = status_sink.get("victim")
+            return av.VideoFrame.from_ndarray(annotated, format="bgr24")
+else:
+    BrowserCameraProcessor = None
+
+
+def render_browser_camera(
+    mode: str,
+    target_profile_id: str | None,
+    location: str,
+) -> None:
+    """Render the browser webcam and its live face-match overlay."""
+    if webrtc_streamer is None or BrowserCameraProcessor is None:
+        st.error("WebRTC is not installed. Run: python -m pip install -r requirements.txt")
+        return
+
+    model_name, detector_backend, metric = get_runtime_face_settings()
+    threshold = float(st.session_state.get("similarity_threshold", COSINE_THRESHOLD))
+    st.info("Allow camera permission, then press START inside the browser camera panel.")
+    try:
+        context = webrtc_streamer(
+            key="n_one_browser_camera",
+            mode=WebRtcMode.SENDRECV,
+            media_stream_constraints={"video": True, "audio": False},
+            video_processor_factory=lambda: BrowserCameraProcessor(
+                mode,
+                target_profile_id,
+                model_name,
+                detector_backend,
+                metric,
+                threshold,
+                location,
+            ),
+            async_processing=True,
+        )
+        if is_victim_search_mode(mode):
+            render_browser_victim_status(context)
+    except Exception as exc:
+        st.error(f"Browser camera panel could not load: {exc}")
+
+
+@st.fragment(run_every="1s")
+def render_browser_victim_status(context) -> None:
+    """Poll the WebRTC worker and show the latest victim match separately."""
+    processor = context.video_processor if context is not None else None
+    result = processor.get_latest_victim() if processor is not None else None
+    if not result:
+        return
+
+    image_path = REG_DIR / str(result.get("image_name", ""))
+    with st.container(border=True):
+        st.success(f"VICTIM FOUND: {result.get('subject', 'Selected victim')}")
+        image_column, details_column = st.columns([1, 2])
+        with image_column:
+            if image_path.is_file():
+                st.image(str(image_path), caption="Matched victim profile", width="content")
+        with details_column:
+            st.write(f"**Profile ID:** `{result.get('profile_id') or 'Unavailable'}`")
+            st.write(f"**Camera location:** {result.get('location') or 'Unavailable'}")
+            st.write(f"**Match distance:** {float(result.get('distance', 0)):.3f}")
+            st.write(f"**Detected at:** {result.get('timestamp') or 'Unavailable'}")
+            st.caption(
+                f"Model: {result.get('model_name')} | Backend: "
+                f"{result.get('detector_backend')} | Metric: {result.get('metric')}"
+            )
+
+
 def render_detection_result(container) -> None:
     """Render a clear, human-readable result for the most recent face event."""
     panel = container.container()
@@ -1187,18 +1418,9 @@ def render_detection_result(container) -> None:
     profile_id = result.get("profile_id", "")
 
     if result_type == "victim_found":
-        panel.success(f"VICTIM FOUND: {subject}{distance_text}")
-        panel.markdown(f"**Camera location:** {current_location or 'Location unavailable'}")
-        history = get_victim_sighting_history(profile_id)
-        if not history.empty:
-            panel.write("**Victim sighting history by location**")
-            panel.dataframe(
-                history[["timestamp", "location"]].rename(
-                    columns={"timestamp": "Last seen", "location": "Camera location"}
-                ),
-                hide_index=True,
-                width="stretch",
-            )
+        # Victim matches are rendered in their own dedicated alert card below.
+        panel.empty()
+        return
     elif result_type == "victim_search":
         panel.info("SEARCHING: Selected victim was not found in the current frame.")
     elif result_type == "known_match":
@@ -1235,6 +1457,114 @@ def render_detection_result(container) -> None:
         event_label = "Current match" if result_type == "unknown_match" else "Last event"
         current_context = f" at {current_location}" if current_location else ""
         panel.caption(f"{event_label}: {timestamp}{current_context}")
+
+
+def render_victim_found_result(container) -> None:
+    """Render the selected victim in a dedicated, high-visibility result card."""
+    result = st.session_state.get("last_detection", {})
+    if not isinstance(result, dict) or result.get("type") != "victim_found":
+        container.empty()
+        return
+
+    subject = result.get("subject", "Selected victim")
+    distance = result.get("distance")
+    distance_text = f"{float(distance):.3f}" if distance is not None else "Unavailable"
+    profile_id = result.get("profile_id", "")
+    image_name = str(result.get("image_name", "")).strip()
+    image_path = REG_DIR / image_name if image_name else Path()
+    if not image_path.is_file() and profile_id:
+        angle_paths = get_profile_angle_paths(profile_id)
+        image_path = angle_paths.get("front") or next(iter(angle_paths.values()), Path())
+
+    with container.container(border=True):
+        st.markdown("### VICTIM FOUND")
+        image_column, details_column = st.columns([1, 2])
+        with image_column:
+            if image_path.is_file():
+                st.image(str(image_path), caption="Matched victim profile", width="content")
+            else:
+                st.warning("Matched victim image is unavailable.")
+        with details_column:
+            st.success(f"{subject} matched successfully")
+            st.write(f"**Profile ID:** `{profile_id or 'Unavailable'}`")
+            st.write(f"**Camera location:** {result.get('location') or 'Unavailable'}")
+            st.write(f"**Match distance:** {distance_text}")
+            st.write(f"**Detected at:** {result.get('timestamp') or 'Unavailable'}")
+            st.caption(
+                "Model: "
+                f"{result.get('model_name') or 'fallback'} | Backend: "
+                f"{result.get('detector_backend') or 'opencv'} | Metric: "
+                f"{result.get('metric') or 'cosine'}"
+            )
+
+        history = get_victim_sighting_history(profile_id)
+        if not history.empty:
+            st.write("**Victim sighting history by location**")
+            st.dataframe(
+                history[["timestamp", "location"]].rename(
+                    columns={"timestamp": "Last seen", "location": "Camera location"}
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+
+
+def _frame_has_content(frame: np.ndarray | None) -> bool:
+    """Reject empty/black camera frames before sending them to recognition."""
+    if frame is None or frame.size == 0:
+        return False
+    return float(frame.std()) > 2.0 or float(frame.mean()) > 5.0
+
+
+def open_video_source(video_target) -> tuple[cv2.VideoCapture | None, str]:
+    """Open a video source and validate that it returns usable frames.
+
+    Windows exposes cameras through different OpenCV backends and device
+    indices. Probe the common combinations for a local webcam instead of
+    assuming device 0. This does not access a browser camera; remote apps
+    still need a WebRTC/browser component.
+    """
+    if not isinstance(video_target, int):
+        capture = cv2.VideoCapture(video_target)
+        if not capture.isOpened():
+            capture.release()
+            return None, "Could not open the selected video source."
+        return capture, ""
+
+    attempts = []
+    backends = [
+        ("DirectShow", cv2.CAP_DSHOW),
+        ("Media Foundation", cv2.CAP_MSMF),
+        ("Default", cv2.CAP_ANY),
+    ]
+    for camera_index in range(3):
+        for backend_name, backend in backends:
+            capture = cv2.VideoCapture(camera_index, backend)
+            if not capture.isOpened():
+                capture.release()
+                attempts.append(f"camera {camera_index}/{backend_name}: unavailable")
+                continue
+
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            usable = False
+            for _ in range(3):
+                ret, frame = capture.read()
+                usable = ret and _frame_has_content(frame)
+                if usable:
+                    break
+            if usable:
+                return capture, f"camera {camera_index} via {backend_name}"
+
+            capture.release()
+            attempts.append(f"camera {camera_index}/{backend_name}: black/no frame")
+
+    return None, (
+        "No usable local webcam frame was found. "
+        "If this app is running remotely, Laptop Webcam requires WebRTC/browser capture. "
+        + " Attempts: "
+        + "; ".join(attempts)
+    )
 
 
 def configure_session_state() -> None:
@@ -1644,6 +1974,17 @@ def render_sidebar() -> None:
                 step=0.05,
                 help="Lower = more strict matching",
             )
+            st.info(
+                "Victim-search recommendation with the full DeepFace runtime: "
+                "Facenet512 + retinaface + cosine. Start around 0.30–0.40 and "
+                "calibrate using one genuine and one different-person test."
+            )
+            if DEEPFACE_IMPORT_ERROR:
+                st.warning(
+                    "Full DeepFace is unavailable here, so the app is using the "
+                    "OpenCV/HOG fallback. Changing model names will not load a "
+                    "neural model until TensorFlow is installed."
+                )
 
         with st.sidebar.expander("Analysis Features", expanded=False):
             st.session_state.enable_attributes = st.checkbox(
@@ -1684,11 +2025,12 @@ def render_main_ui() -> None:
     )
     source_type = col_ctrl2.radio(
         "Select Video Input Source",
-        ["Laptop Webcam", "Recorded Video File", "IP Camera Stream"],
+        ["Browser Webcam (WebRTC)", "Laptop Webcam", "Recorded Video File", "IP Camera Stream"],
         horizontal=True, key="input_source"
     )
 
     video_target = None
+    browser_camera = source_type == "Browser Webcam (WebRTC)"
     if source_type == "Laptop Webcam":
         video_target = 0
     elif source_type == "Recorded Video File":
@@ -1738,7 +2080,7 @@ def render_main_ui() -> None:
 
     button_label = "Stop Surveillance" if st.session_state.streaming else "Start Surveillance"
     if st.button(button_label, width='stretch', type="primary" if not st.session_state.streaming else "secondary"):
-        if not st.session_state.streaming and video_target is None:
+        if not st.session_state.streaming and video_target is None and not browser_camera:
             st.error("Cannot start stream: no valid video source selected.")
         elif not st.session_state.streaming and is_victim_search_mode(mode) and not victim_search_target:
             st.error("Select a Victim profile before starting Lost Person Search.")
@@ -1749,7 +2091,9 @@ def render_main_ui() -> None:
     st.markdown("---")
     status_area = st.empty()
     match_area = st.empty()
+    victim_match_area = st.empty()
     render_detection_result(match_area)
+    render_victim_found_result(victim_match_area)
     frame_placeholder = st.empty()
 
     # Keep the live controls and result panel above the secondary profile
@@ -1757,12 +2101,22 @@ def render_main_ui() -> None:
     render_face_inventory_panel(registered_df)
     render_face_photo_gallery(registered_df)
 
-    if st.session_state.streaming and video_target is not None:
-        cap = cv2.VideoCapture(video_target)
-        if not cap.isOpened():
-            st.error(f"Error: Could not open video source.")
+    if browser_camera and st.session_state.streaming:
+        frame_placeholder.empty()
+        render_browser_camera(mode, victim_search_target, camera_location)
+    elif st.session_state.streaming and video_target is not None:
+        cap, source_status = open_video_source(video_target)
+        if cap is None:
             st.session_state.streaming = False
+            st.error(source_status)
+            status_area.error("Surveillance feed could not be started.")
+            frame_placeholder.error(
+                "Feed unavailable. Select Recorded Video File, or allow webcam access "
+                "and use WebRTC when the app is running remotely."
+            )
         else:
+            if source_status:
+                status_area.info(f"Source: {source_status}")
             while st.session_state.streaming:
                 ret, frame = cap.read()
                 if not ret:
@@ -1770,6 +2124,17 @@ def render_main_ui() -> None:
                     st.warning("Video stream ended or file finished.")
                     cap.release()
                     st.rerun()
+                    break
+
+                if not _frame_has_content(frame):
+                    st.session_state.streaming = False
+                    message = (
+                        "Camera returned a black/empty frame. Check camera permission, "
+                        "another app using the camera, or use WebRTC for a remote app."
+                    )
+                    status_area.error(message)
+                    frame_placeholder.error(message)
+                    cap.release()
                     break
                 
                 annotated_frame, detection_summary = process_frame(
@@ -1782,13 +2147,16 @@ def render_main_ui() -> None:
                 status_text = st.session_state.get('last_status', "Idle")
                 status_area.info(f"Last Status: {status_text}")
                 render_detection_result(match_area)
+                render_victim_found_result(victim_match_area)
                 final_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
                 frame_placeholder.image(final_frame, width='stretch')
                 
                 time.sleep(0.01)
 
-        if cap.isOpened():
+        if cap is not None and cap.isOpened():
             cap.release()
+    elif browser_camera:
+        frame_placeholder.info("Browser webcam is offline. Press Start Surveillance, then press START in the camera panel.")
     else:
         frame_placeholder.info("Surveillance feed is offline. Select a source and start the stream.")
 

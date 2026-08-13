@@ -1,6 +1,6 @@
 # PROJECT N-ONE: Status and Test Report
 
-**Date:** 2026-08-09
+**Date:** 2026-08-13
 
 ---
 
@@ -43,6 +43,12 @@ The following major features were recently implemented and integrated into the a
 - Camera location is captured from the operator and persisted with Victim sightings.
 - `detection_logs/victim_sighting_log.csv` stores throttled sightings and the dashboard displays the latest sighting per location.
 
+### e. Current model and camera instructions
+
+- For Victim Search and Member Attendance Logger, the recommended full-runtime configuration is `Facenet512` + `retinaface` + `cosine`, starting at distance threshold `0.30–0.40` and calibrated on representative footage.
+- If TensorFlow is unavailable, the application reports `OpenCVFaceBackend` and uses frontal/profile Haar detection with HOG/CLAHE fallback features. Sidebar model names do not activate neural inference in that state.
+- `Browser Webcam (WebRTC)` is recommended for live browser or remote cameras. Local webcam, recorded video, and IP streams use OpenCV. Victim Search shows a dedicated Victim Found card; Attendance shows known and unknown details; Threat Detection uses contour/heuristic logic.
+
 ---
 
 ## 3. Documentation Status
@@ -74,13 +80,13 @@ The application test suite and syntax checks were run locally; the vendored Deep
 ### b. Dependency Verification
 
 - The `requirements.txt` file was compared against the libraries imported in `app.py`.
-- **Result:** **No discrepancies found.** All necessary libraries (`streamlit`, `opencv-python-headless`, `numpy`, `pandas`, `Pillow`, `deepface`) are correctly listed in the `requirements.txt` file. The environment appears to be well-defined and reproducible.
+- **Result:** The required packages, including `streamlit-webrtc`, are listed in `requirements.txt`. The application deliberately remains usable with an OpenCV fallback when TensorFlow is unavailable.
 
 ---
 
 ## 5. Validation Results
 
-- `python -m pytest tests -q`: 5 tests passed.
+- `python -m pytest tests -q`: run when pytest is installed; this environment did not provide the pytest command during the latest validation.
 - `python -m py_compile app.py deepface_adapter.py`: passed.
 - `git diff --check`: passed.
 - The full repository pytest command also discovers the vendored `deepface/tests` tree, which has optional dependencies not required by the N-ONE app. Use `python -m pytest tests -q` for the application test suite.

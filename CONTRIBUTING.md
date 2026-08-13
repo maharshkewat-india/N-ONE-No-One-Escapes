@@ -50,7 +50,10 @@ When changing recognition or dashboard behavior, update the relevant root-level 
 - Victim Search must remain target-specific: only the selected Victim can be displayed as a visible match.
 - Unknown faces must continue to be stored/re-identified silently during Victim Search.
 - Camera location belongs in unknown sightings and Victim sighting history.
-- Document user-visible Streamlit connection caveats such as Windows `WinError 10054` when the browser closes during the live loop.
+- `Browser Webcam (WebRTC)` is the recommended live camera path; local webcam/file/IP paths use OpenCV. Document camera permission, black-frame, and Windows `WinError 10054` caveats when changing streaming behavior.
+- Document the difference between full DeepFace/TensorFlow and `OpenCVFaceBackend` fallback. Sidebar model names must not be described as active neural models when the fallback is running.
+- Keep the mode matrix accurate: Victim Search is selected-target-only with a separate Victim Found result; Attendance compares all registered profiles and shows unknown details; Threat Detection uses contour/heuristic logic.
+- When adding a model setting, record the recommended model, detector backend, metric, threshold range, runtime dependency, and whether the setting affects each mode.
 
 Before opening a pull request, run:
 
@@ -58,3 +61,14 @@ Before opening a pull request, run:
 python -m pytest tests -q
 python -m py_compile app.py deepface_adapter.py
 ```
+
+## Current operator contract (2026-08-13)
+
+| User/task | Required action |
+|---|---|
+| Administrator | Register Staff/Victim face-only profiles, preferably with five angles; verify exactly one face is captured; configure and validate the AI runtime. |
+| Operator — Victim Search | Select one Victim, enter location, use WebRTC for browser/remote cameras, and confirm the separate `VICTIM FOUND` card before acting. |
+| Operator — Attendance Logger | Use all Staff/Victim profiles, run a short threshold calibration, and review known plus unknown IDs/details. |
+| Operator — Threat Detection | Select Threat mode and review heuristic alerts manually; face settings are not used for weapon/threat decisions. |
+
+Recommended full-runtime recognition configuration: `Facenet512` + `retinaface` + `cosine`, threshold `0.30–0.40` as a starting range. This recommendation requires TensorFlow/DeepFace to load successfully.
