@@ -25,6 +25,10 @@ except ImportError:  # Keep the dashboard usable until optional WebRTC deps are 
 from deepface_adapter import DEEPFACE_IMPORT_ERROR, DeepFace
 
 
+APP_ROOT = Path(__file__).resolve().parent
+LOGO_PATH = APP_ROOT / "assets" / "n_one_logo.png"
+
+
 AUTH_SECRET_NAMES = (
     "ADMIN_USERNAME",
     "ADMIN_PASSWORD",
@@ -61,7 +65,7 @@ def load_auth_credentials() -> dict[str, str]:
 
 st.set_page_config(
     page_title="N-ONE : NO ONE ESCAPES",
-    page_icon="🎯",
+    page_icon=str(LOGO_PATH) if LOGO_PATH.is_file() else "🎯",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -96,7 +100,7 @@ st.markdown(
 )
 
 # --- Constants and Paths ---
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = APP_ROOT
 REG_DIR = ROOT_DIR / "registered_faces"
 LOG_DIR = ROOT_DIR / "detection_logs"
 UNKNOWN_DIR = ROOT_DIR / "unknown_faces"
@@ -508,7 +512,12 @@ def record_victim_sighting(profile_id: str, name: str, location: str) -> bool:
     matches = sighting_df[sighting_df["profile_id"].astype(str) == str(profile_id)]
     if not matches.empty:
         last = matches.sort_values("timestamp").iloc[-1]
-        last_timestamp = pd.to_datetime(last.get("timestamp"), errors="coerce")
+        last_timestamp_value = last.get("timestamp")
+        last_timestamp = (
+            pd.to_datetime(str(last_timestamp_value), errors="coerce")
+            if last_timestamp_value is not None
+            else pd.NaT
+        )
         current_timestamp = pd.to_datetime(timestamp)
         if (
             str(last.get("location", "")) == location
@@ -1764,8 +1773,16 @@ def clear_registered_profiles() -> None:
     load_known_face_encodings.clear()
 
 
+def render_brand_logo() -> None:
+    """Show the N-ONE brand mark on the current page when the asset exists."""
+    if LOGO_PATH.is_file():
+        st.image(str(LOGO_PATH), width=240)
+
+
 def render_sidebar() -> None:
     st.sidebar.title("🔐 N-ONE Security Gate")
+    if LOGO_PATH.is_file():
+        st.sidebar.image(str(LOGO_PATH), width=180)
     st.sidebar.caption("RBAC access control for surveillance ops")
 
     try:
@@ -2048,6 +2065,7 @@ def render_sidebar() -> None:
 
 
 def render_main_ui() -> None:
+    render_brand_logo()
     st.title("🎯 N-ONE COMMAND CENTER")
 
     st.subheader("⚙️ Operational Console")
@@ -2387,7 +2405,12 @@ def render_facial_analytics_panel() -> None:
             with Image.open(uploaded_batch) as img:
                 img.convert("RGB").save(temp_image)
             
-            analysis_results = analyze_facial_attributes(cv2.imread(str(temp_image)), [])
+            analysis_frame = cv2.imread(str(temp_image))
+            if analysis_frame is None:
+                analysis_results = []
+                st.error("The uploaded image could not be read for analysis.")
+            else:
+                analysis_results = analyze_facial_attributes(analysis_frame, [])
             
             if analysis_results:
                 for idx, result in enumerate(analysis_results):
@@ -2474,6 +2497,8 @@ def main() -> None:
     configure_session_state()
     
     render_sidebar()
+    if not st.session_state.authenticated:
+        render_brand_logo()
     
     if st.session_state.authenticated:
         model_name, detector_backend, _ = get_runtime_face_settings()

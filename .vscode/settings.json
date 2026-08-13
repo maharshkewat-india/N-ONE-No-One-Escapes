@@ -1,4 +1,4 @@
 {
-  "python.defaultInterpreterPath": "C:/Program Files/Python314/python.exe",
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
   "python-envs.defaultEnvManager": "ms-python.python:system"
 }
