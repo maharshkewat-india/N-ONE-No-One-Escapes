@@ -59,18 +59,21 @@ def load_auth_credentials() -> dict[str, str]:
         )
     return {name: value for name, value in credentials.items() if value is not None}
 
+st.set_page_config(
+    page_title="N-ONE : NO ONE ESCAPES",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# `st.set_page_config` must be the first Streamlit command in the script.
+# Show the fallback notice only after page configuration so a missing optional
+# TensorFlow/DeepFace runtime cannot prevent the dashboard from rendering.
 if DEEPFACE_IMPORT_ERROR:
     st.warning(
         "DeepFace runtime is not fully available in this environment. "
         f"The app will continue with a safe fallback. Error: {DEEPFACE_IMPORT_ERROR}"
     )
-
-st.set_page_config(
-    page_title="PROJECT N-ONE | Advanced AI Surveillance Platform",
-    page_icon="🎯",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
 st.markdown(
     """
@@ -398,27 +401,12 @@ def get_registered_profile_count() -> int:
 
 
 def get_unknown_face_count() -> int:
-    """Return the number of unique unknown faces currently tracked."""
-    try:
-        unknown_df = pd.read_csv(UNKNOWN_DB_PATH)
-        if "unknown_id" in unknown_df.columns:
-            unknown_count = int(unknown_df["unknown_id"].dropna().astype(str).nunique())
-            if unknown_count:
-                return unknown_count
-    except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError):
-        pass
-
-    if not UNKNOWN_DIR.exists():
-        return 0
-    return sum(
-        1
-        for image_path in UNKNOWN_DIR.iterdir()
-        if image_path.is_file() and image_path.suffix.lower() in PROFILE_IMAGE_SUFFIXES
-    )
+    """Return the number of unknown faces that still have a saved photo."""
+    return len(get_unknown_profiles_df())
 
 
 def get_unknown_profiles_df() -> pd.DataFrame:
-    """Return unknown profiles with a usable image path for the dashboard gallery."""
+    """Return unknown profiles whose saved photo is actually available."""
     columns = [
         "unknown_id",
         "image_path",
@@ -433,15 +421,34 @@ def get_unknown_profiles_df() -> pd.DataFrame:
     except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError):
         unknown_df = pd.DataFrame(columns=columns)
 
+    known_ids: set[str] = set()
     if "unknown_id" in unknown_df.columns:
         for _, row in unknown_df.drop_duplicates("unknown_id").iterrows():
             unknown_id = str(row.get("unknown_id", ""))
             if not unknown_id or unknown_id == "nan":
                 continue
-            image_path = UNKNOWN_DIR / f"{unknown_id}.jpg"
+
+            # Prefer the current workspace location. Stored absolute paths can
+            # point to an older machine, deployment, or deleted photo.
+            image_candidates = [UNKNOWN_DIR / f"{unknown_id}.jpg"]
             stored_path = str(row.get("image_path", ""))
-            if not image_path.exists() and stored_path and stored_path != "nan":
-                image_path = Path(stored_path)
+            if stored_path and stored_path != "nan":
+                stored_candidate = Path(stored_path)
+                image_candidates.append(
+                    stored_candidate
+                    if stored_candidate.is_absolute()
+                    else ROOT_DIR / stored_candidate
+                )
+            image_path = next(
+                (candidate for candidate in image_candidates if candidate.is_file()),
+                None,
+            )
+            if image_path is None:
+                # Keep stale database rows out of the photo selector. Their
+                # metadata remains in the CSV for audit/history purposes.
+                continue
+
+            known_ids.add(unknown_id)
             records.append(
                 {
                     "unknown_id": unknown_id,
@@ -453,9 +460,15 @@ def get_unknown_profiles_df() -> pd.DataFrame:
                 }
             )
 
-    if not records and UNKNOWN_DIR.exists():
+    # Also show photos created before their database row was written, or rows
+    # from a manually restored unknown_faces directory.
+    if UNKNOWN_DIR.exists():
         for image_path in sorted(UNKNOWN_DIR.iterdir()):
-            if image_path.is_file() and image_path.suffix.lower() in PROFILE_IMAGE_SUFFIXES:
+            if (
+                image_path.is_file()
+                and image_path.suffix.lower() in PROFILE_IMAGE_SUFFIXES
+                and image_path.stem not in known_ids
+            ):
                 records.append(
                     {
                         "unknown_id": image_path.stem,
@@ -1594,6 +1607,8 @@ def configure_session_state() -> None:
         "enable_attributes": True,
         "enable_spoofing_detection": False,
         "similarity_threshold": COSINE_THRESHOLD,
+        "registration_capture_started": False,
+        "registration_capture_source": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1819,6 +1834,10 @@ def render_sidebar() -> None:
             horizontal=True,
             key="registration_photo_source",
         )
+        if st.session_state.registration_capture_source != photo_source:
+            st.session_state.registration_capture_source = photo_source
+            st.session_state.registration_capture_started = False
+
         uploaded_photo = None
         enrollment_captures = st.session_state.setdefault(
             "enrollment_captures", {}
@@ -1843,22 +1862,36 @@ def render_sidebar() -> None:
                     f"Step {completed_count + 1}/{len(ENROLLMENT_ANGLES)} — "
                     f"{ENROLLMENT_INSTRUCTIONS[current_angle]}"
                 )
-                angle_capture = st.sidebar.camera_input(
-                    f"Capture {current_angle.title()} angle",
-                    key=f"registration_camera_{current_angle}",
-                    help="Keep one person centered and ensure the face is clearly visible.",
-                    resolution="720p",
-                )
-                if angle_capture is not None and current_angle not in enrollment_captures:
-                    prepared_crop, crop_message = prepare_single_face_crop(angle_capture)
-                    if prepared_crop is None:
-                        st.sidebar.warning(crop_message)
-                    else:
-                        enrollment_captures[current_angle] = angle_capture.getvalue()
-                        st.sidebar.success(
-                            f"{current_angle.title()} angle accepted. Next angle is ready."
-                        )
+                if not st.session_state.registration_capture_started:
+                    st.sidebar.caption(
+                        "Camera access stays off until you start this capture."
+                    )
+                    if st.sidebar.button(
+                        f"Start {current_angle.title()} capture",
+                        key=f"start_registration_capture_{current_angle}",
+                        type="primary",
+                        width="stretch",
+                    ):
+                        st.session_state.registration_capture_started = True
                         st.rerun()
+                else:
+                    angle_capture = st.sidebar.camera_input(
+                        f"Capture {current_angle.title()} angle",
+                        key=f"registration_camera_{current_angle}",
+                        help="Keep one person centered and ensure the face is clearly visible.",
+                        resolution="720p",
+                    )
+                    if angle_capture is not None and current_angle not in enrollment_captures:
+                        prepared_crop, crop_message = prepare_single_face_crop(angle_capture)
+                        if prepared_crop is None:
+                            st.sidebar.warning(crop_message)
+                        else:
+                            enrollment_captures[current_angle] = angle_capture.getvalue()
+                            st.session_state.registration_capture_started = False
+                            st.sidebar.success(
+                                f"{current_angle.title()} angle accepted. Next angle is ready."
+                            )
+                            st.rerun()
 
             if enrollment_captures:
                 st.sidebar.caption("Captured angles")
@@ -1879,6 +1912,7 @@ def render_sidebar() -> None:
 
                 if st.sidebar.button("Clear angle captures", key="clear_enrollment_captures"):
                     enrollment_captures.clear()
+                    st.session_state.registration_capture_started = False
                     st.rerun()
         else:
             uploaded_photo = st.sidebar.file_uploader(
