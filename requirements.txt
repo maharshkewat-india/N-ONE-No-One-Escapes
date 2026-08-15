@@ -1,8 +1,12 @@
-deepface==0.0.100
+# Base runtime. Supports Python 3.14 using the built-in OpenCV/HOG fallback.
+# For neural DeepFace recognition, use requirements-deepface.txt with Python
+# 3.10-3.13; TensorFlow does not publish Python 3.14 wheels yet.
 numpy==2.4.4
 opencv-python-headless==4.13.0.92
 pandas==3.0.3
 Pillow==12.2.0
 scipy
 streamlit==1.60.0
-streamlit-webrtc==0.77.0
+# WebRTC's media stack has no Python 3.14 wheel. On Python 3.14 the app
+# continues to support local webcam, recorded-video, and IP-camera sources.
+streamlit-webrtc==0.77.0; python_version < "3.14"

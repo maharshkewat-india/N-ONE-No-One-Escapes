@@ -21,6 +21,7 @@ class OpenCVFaceBackend:
         self.error_message = error_message or "OpenCV fallback mode active."
         self.face_cascade = None
         self.profile_cascade = None
+        self.eye_cascade = None
         self.recognizer = None
         self._init_opencv()
 
@@ -49,6 +50,14 @@ class OpenCVFaceBackend:
                 self.profile_cascade = None
         except Exception:
             self.profile_cascade = None
+
+        try:
+            eye_path = cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
+            self.eye_cascade = cv2.CascadeClassifier(eye_path)
+            if self.eye_cascade.empty():
+                self.eye_cascade = None
+        except Exception:
+            self.eye_cascade = None
 
         try:
             # Optional: not required by this adapter's embedding pipeline.
@@ -131,6 +140,36 @@ class OpenCVFaceBackend:
             )
 
         return self._deduplicate_faces(results)
+
+    def is_valid_face_region(self, image: np.ndarray, facial_area: Dict) -> bool:
+        """Reject implausible fallback detections before a high-impact match.
+
+        Haar detection can occasionally fire on clothing or wall texture.  In
+        victim search, a false positive is worse than waiting for a clearer
+        frame, so require a sufficiently large, face-shaped region and at
+        least one eye-like feature in its upper half when the eye cascade is
+        available.  Learned DeepFace backends do not use this fallback check.
+        """
+        try:
+            x = int(facial_area.get("x", 0))
+            y = int(facial_area.get("y", 0))
+            width = int(facial_area.get("w", 0))
+            height = int(facial_area.get("h", 0))
+            if width < 72 or height < 72 or not 0.65 <= width / height <= 1.45:
+                return False
+            crop = image[max(0, y) : y + height, max(0, x) : x + width]
+            if crop.size == 0 or self.eye_cascade is None:
+                return crop.size > 0
+            gray = cv2.equalizeHist(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
+            eyes = self.eye_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=3,
+                minSize=(max(8, width // 10), max(8, height // 10)),
+            )
+            return any(eye_y + eye_h <= int(height * 0.68) for _, eye_y, _, eye_h in eyes)
+        except Exception:
+            return False
 
     @staticmethod
     def _deduplicate_faces(faces: List[Dict]) -> List[Dict]:
@@ -229,6 +268,21 @@ class OpenCVFaceBackend:
             else:
                 # Assume it's already a numpy array
                 img = img_path
+
+            # Registered profiles are already validated face crops.  Preserve
+            # one embedding from the complete crop as an additional reference;
+            # Haar boxes can vary substantially between the enrollment image
+            # and a live camera frame.
+            if kwargs.get("force_full_image", False):
+                height, width = img.shape[:2]
+                if min(height, width) < 32:
+                    return []
+                embedding = self.extract_embedding(img)
+                return ([{
+                    "embedding": embedding.tolist(),
+                    "facial_area": {"x": 0, "y": 0, "w": width, "h": height},
+                    "confidence": 1.0,
+                }] if embedding is not None else [])
 
             # Detect faces
             faces = self.detect_faces(img)

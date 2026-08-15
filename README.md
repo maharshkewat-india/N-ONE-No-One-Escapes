@@ -9,7 +9,8 @@ Follow these steps to get the N-ONE platform running on your local machine.
 
 ### 1. Prerequisites
 
-*   Python 3.10+
+*   Python 3.10+ for the base OpenCV fallback runtime.
+*   Python 3.10-3.13 for neural DeepFace recognition (Facenet512/ArcFace).
 *   Git
 
 ### 2. Installation
@@ -25,6 +26,18 @@ source venv/bin/activate  # On Windows use `venv\Scripts\activate`
 
 # Install dependencies
 pip install -r requirements.txt
+```
+
+The base installation works on Python 3.14, but uses the OpenCV/HOG fallback
+for face matching and supports local webcam, recorded-video, and IP-camera
+sources. TensorFlow and the browser-WebRTC media stack do not provide Python
+3.14 wheels, so install the full neural recognition runtime in a separate
+Python 3.12 or 3.13 virtual environment:
+
+```powershell
+py -3.12 -m venv .venv-deepface
+.\.venv-deepface\Scripts\python.exe -m pip install --upgrade pip
+.\.venv-deepface\Scripts\python.exe -m pip install -r requirements-deepface.txt
 ```
 
 ### 3. Configuration
@@ -74,7 +87,6 @@ If PowerShell blocks the activation script, allow it for the current terminal se
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
-streamlit run app.py
 ```
 
 The first command is the safest option because it directly uses the project's installed dependencies.

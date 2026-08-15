@@ -1,0 +1,10 @@
+# Optional neural face-recognition runtime.
+# Use only with Python 3.10-3.13 on a 64-bit system:
+#   py -3.12 -m venv .venv-deepface
+#   .\.venv-deepface\Scripts\python.exe -m pip install -r requirements-deepface.txt
+# Python 3.14 is intentionally excluded because TensorFlow wheels are not
+# available for it. The base requirements.txt remains usable on Python 3.14.
+-r requirements.txt
+
+deepface==0.0.100; python_version < "3.14"
+tensorflow>=2.16,<2.22; python_version < "3.14"

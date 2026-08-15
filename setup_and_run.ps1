@@ -10,9 +10,10 @@ if (-Not (Test-Path "venv")) {
 # Activate venv
 & ".\venv\Scripts\Activate.ps1"
 
-# Upgrade pip and install required packages
-pip install --upgrade pip
-pip install streamlit pandas opencv-python-headless scipy pillow
+# Upgrade pip and install the base runtime. This works on Python 3.14 using
+# the built-in OpenCV fallback; see requirements-deepface.txt for full AI mode.
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 
 # Run the app
 streamlit run app.py

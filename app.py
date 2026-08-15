@@ -90,9 +90,52 @@ st.markdown(
         border: none;
         font-weight: 600;
         border-radius: 8px;
+        transition: transform 150ms ease, filter 150ms ease, box-shadow 150ms ease;
     }
     div.stButton > button:hover {
         filter: brightness(1.08);
+        transform: translateY(-2px);
+        box-shadow: 0 8px 18px rgba(34, 197, 94, 0.28);
+    }
+    div.stButton > button:active {
+        transform: translateY(1px) scale(0.98);
+        box-shadow: none;
+    }
+    .surveillance-state {
+        display: flex;
+        align-items: center;
+        gap: 0.55rem;
+        width: fit-content;
+        margin: 0.6rem 0;
+        padding: 0.5rem 0.8rem;
+        border-radius: 999px;
+        font-weight: 650;
+    }
+    .surveillance-state.live {
+        color: #bbf7d0;
+        background: rgba(22, 163, 74, 0.18);
+        border: 1px solid rgba(74, 222, 128, 0.55);
+    }
+    .surveillance-state.offline {
+        color: #cbd5e1;
+        background: rgba(148, 163, 184, 0.12);
+        border: 1px solid rgba(148, 163, 184, 0.35);
+    }
+    .status-dot {
+        width: 0.6rem;
+        height: 0.6rem;
+        border-radius: 50%;
+        background: currentColor;
+    }
+    .live .status-dot {
+        animation: status-pulse 1.15s ease-in-out infinite;
+    }
+    @keyframes status-pulse {
+        0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.75); }
+        50% { transform: scale(1.18); box-shadow: 0 0 0 0.55rem rgba(74, 222, 128, 0); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        div.stButton > button:first-child, .live .status-dot { animation: none; transition: none; }
     }
     </style>
     """,
@@ -565,12 +608,56 @@ def get_runtime_face_settings() -> tuple[str, str, str]:
     )
 
 
-@st.cache_resource
+def represent_registered_face(
+    image_path: Path,
+    model_name: str,
+    detector_backend: str,
+) -> list[dict]:
+    """Create an embedding for a saved face-only enrollment image.
+
+    Enrollment saves a tight face crop.  Such an image does not always have
+    enough context for a detector to find a face again, particularly when the
+    OpenCV/HOG fallback is active.  Retry with the whole crop so registered
+    Victim profiles never enter the known-face cache with a missing embedding.
+    """
+    common_args = {
+        "img_path": str(image_path),
+        "model_name": model_name,
+        "detector_backend": detector_backend,
+        "enforce_detection": False,
+        "align": True,
+        "silent": True,
+    }
+    representations: list[dict] = []
+    try:
+        representations = DeepFace.represent(**common_args) or []
+    except Exception:
+        pass
+
+    # The bundled OpenCV fallback accepts this extra argument and generates an
+    # embedding from the whole enrollment crop.  A full DeepFace installation
+    # may not support it, in which case its detector-based result above is
+    # retained unchanged.
+    try:
+        crop_representation = DeepFace.represent(
+            **common_args, allow_full_image=True, force_full_image=True
+        ) or []
+        return representations + crop_representation
+    except Exception:
+        return representations
+
+
 def load_known_face_encodings(
     model_name: str = DEEPFACE_MODEL,
     detector_backend: str = DEEPFACE_BACKEND,
 ) -> None:
-    """Load registered encodings using the same detector settings as live frames."""
+    """Refresh all registered-face embeddings directly from the profile database.
+
+    This intentionally is not a Streamlit resource cache. The function fills
+    a process-global list consumed by the camera worker; caching a function
+    with only this side effect can leave a stale/empty profile list after an
+    administrator replaces or adds multi-angle images.
+    """
     if DeepFace is None:
         return
 
@@ -582,31 +669,33 @@ def load_known_face_encodings(
         profile_id = get_profile_id(img_path.stem)
         name = get_profile_name(profile_id)
         role = get_profile_category(profile_id)
-        embedding = None
         try:
-            embedding_obj = DeepFace.represent(
-                img_path=str(img_path),
-                model_name=model_name,
-                detector_backend=detector_backend,
-                enforce_detection=False,
-                align=True,
-                silent=True,
+            embedding_obj = represent_registered_face(
+                img_path, model_name, detector_backend
             )
-            if embedding_obj and len(embedding_obj) > 0:
-                embedding = embedding_obj[0].get("embedding")
         except Exception as e:
             st.warning(f"Could not process {img_path.name}: {e}")
+            embedding_obj = []
 
-        KNOWN_FACE_ENCODINGS.append(
-            {
-                "profile_id": profile_id,
-                "name": name,
-                "role": role,
-                "angle": get_profile_angle(img_path.stem),
-                "image_path": str(img_path),
-                "encoding": embedding,
-            }
-        )
+        # A profile crop can produce more than one valid detector region.
+        # Keep every embedding so matching uses the closest angle/crop rather
+        # than arbitrarily discarding all but the first representation.
+        valid_embeddings = [
+            item.get("embedding")
+            for item in embedding_obj
+            if isinstance(item, dict) and item.get("embedding") is not None
+        ]
+        for embedding in valid_embeddings or [None]:
+            KNOWN_FACE_ENCODINGS.append(
+                {
+                    "profile_id": profile_id,
+                    "name": name,
+                    "role": role,
+                    "angle": get_profile_angle(img_path.stem),
+                    "image_path": str(img_path),
+                    "encoding": embedding,
+                }
+            )
 
 
 def calculate_face_distance(
@@ -660,6 +749,14 @@ def find_face_in_known_cache(
         return None
 
     return {**best_match, "distance": float(best_distance)}
+
+
+def is_valid_victim_match_candidate(frame: np.ndarray, facial_area: dict) -> bool:
+    """Apply stricter fallback validation before declaring a victim match."""
+    validator = getattr(DeepFace, "is_valid_face_region", None)
+    if callable(validator):
+        return bool(validator(frame, facial_area))
+    return True
 
 
 def record_detection_result(
@@ -1029,6 +1126,13 @@ def process_frame(
             
         face_encoding = face_obj["embedding"]
 
+        if victim_search and not is_valid_victim_match_candidate(
+            processing_frame, facial_area
+        ):
+            # Never turn a low-quality Haar false detection (for example,
+            # clothing texture) into a victim alert.
+            continue
+
         # Step A: Check against the KNOWN faces in-memory cache
         match_threshold = float(
             st.session_state.get("similarity_threshold", COSINE_THRESHOLD)
@@ -1132,8 +1236,12 @@ def process_frame(
                     previous_location=previous_sighting.get("location", ""),
                 )
             if victim_search:
-                # Victim search is strict: non-target faces are not annotated
-                # or shown as matches. Only the selected victim gets a box.
+                # Keep the selected victim's identity private until verified,
+                # while still confirming that camera face detection is working.
+                color = (0, 255, 0)
+                label = "FACE DETECTED - NO MATCH"
+                cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(annotated_frame, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
                 continue
             elif attendance_mode:
                 color = (0, 0, 255)
@@ -1171,7 +1279,12 @@ def process_frame(
                 location=location,
             )
         if victim_search:
-            # Do not display non-target faces in the victim-search feed.
+            # A green box confirms detection without incorrectly identifying
+            # the person as the selected victim.
+            color = (0, 255, 0)
+            label = "FACE DETECTED - NO MATCH"
+            cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(annotated_frame, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             continue
         elif attendance_mode:
             color = (0, 0, 255)
@@ -1269,6 +1382,10 @@ def annotate_browser_frame(
         w, h = int(area.get("w", 0)), int(area.get("h", 0))
         if w <= 0 or h <= 0:
             continue
+        if is_victim_search_mode(mode) and not is_valid_victim_match_candidate(
+            processing_frame, area
+        ):
+            continue
         if is_victim_search_mode(mode):
             match = (
                 find_face_in_known_cache(
@@ -1306,8 +1423,10 @@ def annotate_browser_frame(
                 label = f"MATCH: {match['name']} ({match['distance']:.2f})"
                 color = (0, 200, 0)
         elif is_victim_search_mode(mode):
-            # In victim-search mode, do not label other people as Unknown.
-            continue
+            # Detection is visible, but an unmatched person is never labelled
+            # as the selected victim or given an identity.
+            label = "FACE DETECTED - NO MATCH"
+            color = (0, 255, 0)
         else:
             label = "Unknown"
             color = (0, 165, 255)
@@ -1737,7 +1856,6 @@ def save_registered_profile_captures(
         cv2.imwrite(str(destination), crop)
 
     model_name, detector_backend, _ = get_runtime_face_settings()
-    load_known_face_encodings.clear()
     load_known_face_encodings(model_name, detector_backend)
     return True, f"Saved {len(crops)} angle captures for {name}."
 
@@ -1770,7 +1888,38 @@ def clear_registered_profiles() -> None:
     for profile_path in REG_DIR.glob("*"):
         if profile_path.is_file():
             profile_path.unlink()
-    load_known_face_encodings.clear()
+    KNOWN_FACE_ENCODINGS.clear()
+
+
+def clear_unknown_face_data() -> None:
+    """Remove unknown-face photos and tracking records, then recreate empty logs."""
+    global UNKNOWN_FACE_CACHE_SETTINGS, UNKNOWN_FACE_CACHE_BUILT_VERSION
+
+    for face_path in UNKNOWN_DIR.glob("*"):
+        if face_path.is_file():
+            face_path.unlink()
+
+    for data_path in (UNKNOWN_DB_PATH, UNKNOWN_SIGHTING_LOG_PATH):
+        if data_path.exists():
+            data_path.unlink()
+
+    UNKNOWN_FACE_ENCODINGS.clear()
+    UNKNOWN_SIGHTING_LAST_WRITE.clear()
+    UNKNOWN_SIGHTING_MEMORY.clear()
+    invalidate_unknown_face_cache()
+    UNKNOWN_FACE_CACHE_SETTINGS = None
+    UNKNOWN_FACE_CACHE_BUILT_VERSION = -1
+    initialize_directories()
+    initialize_log_files()
+
+
+def clear_all_surveillance_data() -> None:
+    """Remove registered faces, unknown faces, logs, and the temporary upload."""
+    clear_registered_profiles()
+    clear_unknown_face_data()
+    clear_audit_log()
+    if TEMP_VIDEO_PATH.exists():
+        TEMP_VIDEO_PATH.unlink()
 
 
 def render_brand_logo() -> None:
@@ -2051,14 +2200,47 @@ def render_sidebar() -> None:
 
         st.sidebar.markdown("---")
         st.sidebar.header("Admin Actions")
+        st.sidebar.warning("These actions permanently delete local surveillance data.")
+        deletion_confirmed = st.sidebar.checkbox(
+            "I understand this cannot be undone",
+            key="admin_deletion_confirmed",
+        )
         if st.sidebar.button(
-            "Clear All Registered Profiles", width="stretch", type="primary"
+            "Clear registered profiles",
+            width="stretch",
+            type="primary",
+            disabled=not deletion_confirmed,
         ):
             clear_registered_profiles()
             st.sidebar.success("All registered profiles deleted.")
-        if st.sidebar.button("Reset Full Audit Log", width="stretch", type="primary"):
+            st.rerun()
+        if st.sidebar.button(
+            "Clear unknown face data",
+            width="stretch",
+            type="primary",
+            disabled=not deletion_confirmed,
+        ):
+            clear_unknown_face_data()
+            st.sidebar.success("Unknown-face photos and tracking records deleted.")
+            st.rerun()
+        if st.sidebar.button(
+            "Reset audit logs",
+            width="stretch",
+            type="primary",
+            disabled=not deletion_confirmed,
+        ):
             clear_audit_log()
-            st.sidebar.success("Audit log reset.")
+            st.sidebar.success("Audit logs reset.")
+            st.rerun()
+        if st.sidebar.button(
+            "Clear all surveillance data",
+            width="stretch",
+            type="primary",
+            disabled=not deletion_confirmed,
+        ):
+            clear_all_surveillance_data()
+            st.sidebar.success("All registered, unknown, log, and temporary-upload data deleted.")
+            st.rerun()
 
     return
 
@@ -2139,6 +2321,19 @@ def render_main_ui() -> None:
         else:
             st.session_state.streaming = not st.session_state.streaming
             st.rerun()
+
+    if st.session_state.streaming:
+        st.markdown(
+            '<div class="surveillance-state live"><span class="status-dot"></span>'
+            'Surveillance is live — camera feed is processing.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="surveillance-state offline"><span class="status-dot"></span>'
+            'Surveillance is offline — press Start Surveillance to begin.</div>',
+            unsafe_allow_html=True,
+        )
 
     st.markdown("---")
     status_area = st.empty()
